@@ -20,15 +20,17 @@ jobs:
 
       - name: Generate typewriter ASS subtitles
         run: |
-          python3 << 'PYEOF'
-          import re, subprocess, os
+          cat > generate_captions.py << 'PYEOF'
+          import re
+          import subprocess
+          import os
+          import textwrap
 
           SRC = "src"
           TXT_PATH = os.path.join(SRC, "AppPromotion.txt")
           AUDIO_PATH = os.path.join(SRC, "AppVideo.mp3")
           ASS_PATH = "captions.ass"
 
-          # Audio-র দৈর্ঘ্য বের করা হচ্ছে
           out = subprocess.run(
               ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                "-of", "default=noprint_wrappers=1:nokey=1", AUDIO_PATH],
@@ -36,7 +38,6 @@ jobs:
           )
           audio_duration = float(out.stdout.strip())
 
-          # [m:ss] টাইমস্ট্যাম্প যুক্ত লাইনগুলো পার্স করা হচ্ছে
           entries = []
           pattern = re.compile(r'^\[(\d+):(\d+)\]\s*(.+)$')
           with open(TXT_PATH, encoding="utf-8") as f:
@@ -54,26 +55,28 @@ jobs:
               h = int(t // 3600)
               m = int((t % 3600) // 60)
               s = t % 60
-              return f"{h}:{m:02d}:{s:05.2f}"
+              return "{}:{:02d}:{:05.2f}".format(h, m, s)
 
           def escape_ass(text):
               return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
-          header = """[Script Info]
-Title: AppPromotion Typewriter
-ScriptType: v4.00+
-PlayResX: 2160
-PlayResY: 3840
-WrapStyle: 0
-ScaledBorderAndShadow: yes
+          header = textwrap.dedent("""\
+              [Script Info]
+              Title: AppPromotion Typewriter
+              ScriptType: v4.00+
+              PlayResX: 2160
+              PlayResY: 3840
+              WrapStyle: 0
+              ScaledBorderAndShadow: yes
 
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,SolaimanLipi,95,&H00000000,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,100,100,320,1
+              [V4+ Styles]
+              Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+              Style: Default,SolaimanLipi,95,&H00000000,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,100,100,320,1
 
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
+              [Events]
+              Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+              """)
+
           lines = [header]
 
           for i, (start, text) in enumerate(entries):
@@ -83,7 +86,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
               if n == 0 or duration <= 0:
                   continue
 
-              # প্রতি অক্ষর কতক্ষণে দেখাবে (টাইপরাইটার স্পিড)
               char_dur = 0.055
               reveal_time = n * char_dur
               max_reveal = duration * 0.7
@@ -97,13 +99,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                   if t0 >= end:
                       break
                   sub = escape_ass(text[:k])
-                  lines.append(f"Dialogue: 0,{ass_time(t0)},{ass_time(t1)},Default,,0,0,0,,{sub}\n")
+                  lines.append("Dialogue: 0,{},{},Default,,0,0,0,,{}\n".format(ass_time(t0), ass_time(t1), sub))
 
           with open(ASS_PATH, "w", encoding="utf-8") as f:
               f.writelines(lines)
 
-          print(f"Audio duration: {audio_duration:.2f}s, caption lines: {len(entries)}")
+          print("Audio duration: {:.2f}s, caption lines: {}".format(audio_duration, len(entries)))
           PYEOF
+          python3 generate_captions.py
 
       - name: Render 4K vertical (2160x3840) video
         run: |
