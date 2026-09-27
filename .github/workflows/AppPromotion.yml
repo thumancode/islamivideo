@@ -1,0 +1,124 @@
+name: Generate AppPromotion Video
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-video:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Generate typewriter ASS subtitles
+        run: |
+          python3 << 'PYEOF'
+          import re, subprocess, os
+
+          SRC = "src"
+          TXT_PATH = os.path.join(SRC, "AppPromotion.txt")
+          AUDIO_PATH = os.path.join(SRC, "AppVideo.mp3")
+          ASS_PATH = "captions.ass"
+
+          # Audio-র দৈর্ঘ্য বের করা হচ্ছে
+          out = subprocess.run(
+              ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+               "-of", "default=noprint_wrappers=1:nokey=1", AUDIO_PATH],
+              capture_output=True, text=True
+          )
+          audio_duration = float(out.stdout.strip())
+
+          # [m:ss] টাইমস্ট্যাম্প যুক্ত লাইনগুলো পার্স করা হচ্ছে
+          entries = []
+          pattern = re.compile(r'^\[(\d+):(\d+)\]\s*(.+)$')
+          with open(TXT_PATH, encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  m = pattern.match(line)
+                  if m:
+                      minutes, seconds, text = m.groups()
+                      start = int(minutes) * 60 + int(seconds)
+                      entries.append((start, text.strip()))
+          entries.sort(key=lambda e: e[0])
+
+          def ass_time(t):
+              t = max(t, 0)
+              h = int(t // 3600)
+              m = int((t % 3600) // 60)
+              s = t % 60
+              return f"{h}:{m:02d}:{s:05.2f}"
+
+          def escape_ass(text):
+              return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+          header = """[Script Info]
+Title: AppPromotion Typewriter
+ScriptType: v4.00+
+PlayResX: 2160
+PlayResY: 3840
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,SolaimanLipi,95,&H00000000,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,100,100,320,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+          lines = [header]
+
+          for i, (start, text) in enumerate(entries):
+              end = entries[i + 1][0] if i + 1 < len(entries) else audio_duration
+              duration = end - start
+              n = len(text)
+              if n == 0 or duration <= 0:
+                  continue
+
+              # প্রতি অক্ষর কতক্ষণে দেখাবে (টাইপরাইটার স্পিড)
+              char_dur = 0.055
+              reveal_time = n * char_dur
+              max_reveal = duration * 0.7
+              if reveal_time > max_reveal and max_reveal > 0:
+                  char_dur = max_reveal / n
+
+              for k in range(1, n + 1):
+                  t0 = start + (k - 1) * char_dur
+                  t1 = start + k * char_dur if k < n else end
+                  t1 = min(t1, end)
+                  if t0 >= end:
+                      break
+                  sub = escape_ass(text[:k])
+                  lines.append(f"Dialogue: 0,{ass_time(t0)},{ass_time(t1)},Default,,0,0,0,,{sub}\n")
+
+          with open(ASS_PATH, "w", encoding="utf-8") as f:
+              f.writelines(lines)
+
+          print(f"Audio duration: {audio_duration:.2f}s, caption lines: {len(entries)}")
+          PYEOF
+
+      - name: Render 4K vertical (2160x3840) video
+        run: |
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 src/AppVideo.mp3)
+          ffmpeg -y \
+            -f lavfi -i "color=c=white:s=2160x3840:r=30:d=${DURATION}" \
+            -i src/AppVideo.mp3 \
+            -vf "subtitles=captions.ass:fontsdir=src" \
+            -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
+            -c:a aac -b:a 192k \
+            -shortest \
+            app_promotion_4k_9x16.mp4
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-promotion-video
+          path: app_promotion_4k_9x16.mp4
