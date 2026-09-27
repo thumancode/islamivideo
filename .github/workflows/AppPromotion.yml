@@ -2,46 +2,123 @@ name: Generate AppPromotion Video
 
 on:
   workflow_dispatch:
+    inputs:
+      font_size:
+        description: "Text font size (px, canvas is 4K vertical)"
+        required: false
+        default: "90"
+      align_horizontal:
+        description: "Horizontal text alignment"
+        required: false
+        default: "center"
+        type: choice
+        options:
+          - left
+          - center
+          - right
+      align_vertical:
+        description: "Vertical text anchor"
+        required: false
+        default: "bottom"
+        type: choice
+        options:
+          - top
+          - center
+          - bottom
+      margin_top:
+        description: "Top margin (px) - used when align_vertical = top"
+        required: false
+        default: "0"
+      margin_bottom:
+        description: "Bottom margin (px) - used when align_vertical = bottom"
+        required: false
+        default: "850"
+      margin_left:
+        description: "Left margin (px)"
+        required: false
+        default: "100"
+      margin_right:
+        description: "Right margin (px)"
+        required: false
+        default: "100"
+      text_color:
+        description: "Text color (hex, e.g. #000000)"
+        required: false
+        default: "#000000"
+      chars_per_second:
+        description: "Typewriter speed (characters per second)"
+        required: false
+        default: "18"
+      video_width:
+        description: "Output video width (px)"
+        required: false
+        default: "2160"
+      video_height:
+        description: "Output video height (px)"
+        required: false
+        default: "3840"
 
 jobs:
   build-video:
     runs-on: ubuntu-latest
+    env:
+      FONT_SIZE: ${{ github.event.inputs.font_size }}
+      ALIGN_H: ${{ github.event.inputs.align_horizontal }}
+      ALIGN_V: ${{ github.event.inputs.align_vertical }}
+      MARGIN_TOP: ${{ github.event.inputs.margin_top }}
+      MARGIN_BOTTOM: ${{ github.event.inputs.margin_bottom }}
+      MARGIN_LEFT: ${{ github.event.inputs.margin_left }}
+      MARGIN_RIGHT: ${{ github.event.inputs.margin_right }}
+      TEXT_COLOR: ${{ github.event.inputs.text_color }}
+      CHARS_PER_SECOND: ${{ github.event.inputs.chars_per_second }}
+      VIDEO_WIDTH: ${{ github.event.inputs.video_width }}
+      VIDEO_HEIGHT: ${{ github.event.inputs.video_height }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg and fontconfig
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg fontconfig
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install SolaimanLipi font system-wide
+      - name: Install Pillow (with RAQM complex-script shaping)
         run: |
-          mkdir -p ~/.local/share/fonts
-          cp src/solaimanlipi.ttf ~/.local/share/fonts/
-          fc-cache -f ~/.local/share/fonts
+          pip install --upgrade Pillow
+          python3 -c "from PIL import features; print('raqm:', features.check('raqm')); print('harfbuzz:', features.check('harfbuzz')); print('fribidi:', features.check('fribidi'))"
 
-          FONT_FAMILY=$(fc-scan --format "%{family}\n" src/solaimanlipi.ttf | head -n1 | cut -d',' -f1)
-          echo "Detected font family: $FONT_FAMILY"
-          fc-list | grep -i "solaiman" || echo "WARNING: font not showing in fc-list"
-          echo "FONT_FAMILY=$FONT_FAMILY" >> "$GITHUB_ENV"
-
-      - name: Generate typewriter ASS subtitles
+      - name: Generate typewriter frames + concat list
         run: |
-          cat > generate_captions.py << 'PYEOF'
+          cat > generate_frames.py << 'PYEOF'
           import re
           import subprocess
           import os
-          import textwrap
+          from PIL import Image, ImageDraw, ImageFont
 
           SRC = "src"
           TXT_PATH = os.path.join(SRC, "AppPromotion.txt")
           AUDIO_PATH = os.path.join(SRC, "AppVideo.mp3")
-          ASS_PATH = "captions.ass"
-          FONT_FAMILY = os.environ.get("FONT_FAMILY", "SolaimanLipi").strip() or "SolaimanLipi"
+          FONT_PATH = os.path.join(SRC, "solaimanlipi.ttf")
+          FRAMES_DIR = "frames"
+          CONCAT_PATH = "framelist.txt"
+
+          W = int(os.environ.get("VIDEO_WIDTH") or "2160")
+          H = int(os.environ.get("VIDEO_HEIGHT") or "3840")
+          FONT_SIZE = int(os.environ.get("FONT_SIZE") or "90")
+          ALIGN_H = (os.environ.get("ALIGN_H") or "center").lower()
+          ALIGN_V = (os.environ.get("ALIGN_V") or "bottom").lower()
+          MARGIN_TOP = int(os.environ.get("MARGIN_TOP") or "0")
+          MARGIN_BOTTOM = int(os.environ.get("MARGIN_BOTTOM") or "850")
+          MARGIN_LEFT = int(os.environ.get("MARGIN_LEFT") or "100")
+          MARGIN_RIGHT = int(os.environ.get("MARGIN_RIGHT") or "100")
+          TEXT_COLOR = os.environ.get("TEXT_COLOR") or "#000000"
+          CHARS_PER_SECOND = float(os.environ.get("CHARS_PER_SECOND") or "18")
+          LINE_SPACING = int(FONT_SIZE * 0.35)
+
+          os.makedirs(FRAMES_DIR, exist_ok=True)
 
           out = subprocess.run(
               ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -62,35 +139,69 @@ jobs:
                       entries.append((start, text.strip()))
           entries.sort(key=lambda e: e[0])
 
-          def ass_time(t):
-              t = max(t, 0)
-              h = int(t // 3600)
-              m = int((t % 3600) // 60)
-              s = t % 60
-              return "{}:{:02d}:{:05.2f}".format(h, m, s)
+          try:
+              font = ImageFont.truetype(FONT_PATH, FONT_SIZE, layout_engine=ImageFont.Layout.RAQM)
+          except Exception as e:
+              print("WARNING: RAQM layout unavailable ({}), falling back to basic layout".format(e))
+              font = ImageFont.truetype(FONT_PATH, FONT_SIZE)
 
-          def escape_ass(text):
-              return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+          max_text_width = W - MARGIN_LEFT - MARGIN_RIGHT
 
-          header_template = textwrap.dedent("""\
-              [Script Info]
-              Title: AppPromotion Typewriter
-              ScriptType: v4.00+
-              PlayResX: 2160
-              PlayResY: 3840
-              WrapStyle: 0
-              ScaledBorderAndShadow: yes
+          def wrap_text(draw, text):
+              if not text:
+                  return []
+              words = text.split(" ")
+              lines = []
+              current = ""
+              for word in words:
+                  candidate = (current + " " + word).strip()
+                  bbox = draw.textbbox((0, 0), candidate, font=font)
+                  if bbox[2] - bbox[0] <= max_text_width or not current:
+                      current = candidate
+                  else:
+                      lines.append(current)
+                      current = word
+              if current:
+                  lines.append(current)
+              return lines
 
-              [V4+ Styles]
-              Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-              Style: Default,{font},95,&H00000000,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,100,100,850,1
+          def render_frame(text, path):
+              img = Image.new("RGB", (W, H), "white")
+              draw = ImageDraw.Draw(img)
+              lines = wrap_text(draw, text)
+              if lines:
+                  line_heights = []
+                  line_widths = []
+                  for line in lines:
+                      bbox = draw.textbbox((0, 0), line, font=font)
+                      line_widths.append(bbox[2] - bbox[0])
+                      line_heights.append(bbox[3] - bbox[1])
+                  total_height = sum(line_heights) + LINE_SPACING * (len(lines) - 1)
 
-              [Events]
-              Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-              """)
-          header = header_template.format(font=FONT_FAMILY)
+                  if ALIGN_V == "top":
+                      y = MARGIN_TOP
+                  elif ALIGN_V == "center":
+                      y = (H - total_height) // 2
+                  else:
+                      y = H - MARGIN_BOTTOM - total_height
 
-          lines = [header]
+                  for line, lw, lh in zip(lines, line_widths, line_heights):
+                      if ALIGN_H == "left":
+                          x = MARGIN_LEFT
+                      elif ALIGN_H == "right":
+                          x = W - MARGIN_RIGHT - lw
+                      else:
+                          x = MARGIN_LEFT + (max_text_width - lw) // 2
+                      draw.text((x, y), line, font=font, fill=TEXT_COLOR)
+                      y += lh + LINE_SPACING
+
+              img.save(path)
+
+          events = []
+          if entries and entries[0][0] > 0:
+              events.append((0.0, float(entries[0][0]), ""))
+
+          char_dur_default = 1.0 / CHARS_PER_SECOND
 
           for i, (start, text) in enumerate(entries):
               end = entries[i + 1][0] if i + 1 < len(entries) else audio_duration
@@ -98,38 +209,47 @@ jobs:
               n = len(text)
               if n == 0 or duration <= 0:
                   continue
-
-              char_dur = 0.055
+              char_dur = char_dur_default
               reveal_time = n * char_dur
               max_reveal = duration * 0.7
               if reveal_time > max_reveal and max_reveal > 0:
                   char_dur = max_reveal / n
-
               for k in range(1, n + 1):
                   t0 = start + (k - 1) * char_dur
                   t1 = start + k * char_dur if k < n else end
                   t1 = min(t1, end)
                   if t0 >= end:
                       break
-                  sub = escape_ass(text[:k])
-                  lines.append("Dialogue: 0,{},{},Default,,0,0,0,,{}\n".format(ass_time(t0), ass_time(t1), sub))
+                  events.append((float(t0), float(t1), text[:k]))
 
-          with open(ASS_PATH, "w", encoding="utf-8") as f:
-              f.writelines(lines)
+          concat_lines = []
+          idx = 0
+          for t0, t1, text in events:
+              dur = t1 - t0
+              if dur <= 0:
+                  continue
+              idx += 1
+              fname = os.path.join(FRAMES_DIR, "frame_{:05d}.png".format(idx))
+              render_frame(text, fname)
+              concat_lines.append("file '{}'\n".format(fname))
+              concat_lines.append("duration {:.3f}\n".format(dur))
 
-          print("Font family used: {}".format(FONT_FAMILY))
-          print("Audio duration: {:.2f}s, caption lines: {}".format(audio_duration, len(entries)))
+          if concat_lines:
+              last_file_line = concat_lines[-2]
+              concat_lines.append(last_file_line)
+
+          with open(CONCAT_PATH, "w", encoding="utf-8") as f:
+              f.writelines(concat_lines)
+
+          print("Rendered {} frames. Audio duration: {:.2f}s".format(idx, audio_duration))
           PYEOF
-          python3 generate_captions.py
+          python3 generate_frames.py
 
-      - name: Render 4K vertical (2160x3840) video
+      - name: Render final 4K video (concat frames + mux audio)
         run: |
-          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 src/AppVideo.mp3)
-          ffmpeg -y \
-            -f lavfi -i "color=c=white:s=2160x3840:r=30:d=${DURATION}" \
-            -i src/AppVideo.mp3 \
-            -vf "subtitles=captions.ass:fontsdir=src" \
-            -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
+          ffmpeg -y -f concat -safe 0 -i framelist.txt -i src/AppVideo.mp3 \
+            -vf "fps=30,format=yuv420p" \
+            -c:v libx264 -preset medium -crf 18 \
             -c:a aac -b:a 192k \
             -shortest \
             app_promotion_4k_9x16.mp4
