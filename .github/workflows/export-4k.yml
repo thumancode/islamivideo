@@ -1,0 +1,160 @@
+name: Export Video to 4K
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_path:
+        description: 'Repo-এ থাকা ভিডিওর পাথ (ex: video/islamiencyclopediaPromotion.mp4). video_url না দিলে এটা ব্যবহার হবে।'
+        required: false
+        default: ''
+      video_url:
+        description: 'ভিডিওর ডাইরেক্ট ডাউনলোড লিংক (দিলে এটা video_path এর চেয়ে অগ্রাধিকার পাবে)'
+        required: false
+        default: ''
+      output_name:
+        description: 'আউটপুট ফাইলের নাম (এক্সটেনশন ছাড়া)'
+        required: false
+        default: 'output_4k'
+      crf:
+        description: 'ভিডিও কোয়ালিটি (CRF): কম সংখ্যা = বেশি কোয়ালিটি, বড় সাইজ। 4K এর জন্য 16-20 রেকমেন্ডেড।'
+        required: false
+        default: '18'
+
+permissions:
+  contents: write
+
+jobs:
+  export-4k:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+
+      - name: Validate inputs
+        run: |
+          set -e
+          if [ -z "${{ github.event.inputs.video_url }}" ] && [ -z "${{ github.event.inputs.video_path }}" ]; then
+            echo "::error::video_path অথবা video_url এর যেকোনো একটা অবশ্যই দিতে হবে।"
+            exit 1
+          fi
+
+      - name: Prepare input video (from repo path or URL)
+        id: input
+        run: |
+          set -e
+          mkdir -p input_video
+
+          VIDEO_URL="${{ github.event.inputs.video_url }}"
+          VIDEO_PATH="${{ github.event.inputs.video_path }}"
+
+          if [ -n "$VIDEO_URL" ]; then
+            echo "▶ ডাইরেক্ট লিংক থেকে ভিডিও ডাউনলোড করা হচ্ছে..."
+            curl -L --fail --retry 3 --retry-delay 5 -o "input_video/source_input" "$VIDEO_URL"
+
+            # আসল এক্সটেনশন বের করার চেষ্টা (না পেলে mp4 ধরে নেওয়া হবে)
+            EXT="$(echo "$VIDEO_URL" | grep -oE '\.[a-zA-Z0-9]{2,4}(\?|$)' | head -n1 | sed 's/[^a-zA-Z0-9.]//g')"
+            if [ -z "$EXT" ]; then EXT=".mp4"; fi
+
+            mv "input_video/source_input" "input_video/source${EXT}"
+            echo "video_file=input_video/source${EXT}" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "▶ মূল রিপোজিটরি থেকে ভিডিও কপি করা হচ্ছে: $VIDEO_PATH"
+            if [ ! -f "$VIDEO_PATH" ]; then
+              echo "::error::Repo-তে এই পাথে ভিডিও পাওয়া যায়নি: $VIDEO_PATH"
+              exit 1
+            fi
+            EXT=".${VIDEO_PATH##*.}"
+            cp "$VIDEO_PATH" "input_video/source${EXT}"
+            echo "video_file=input_video/source${EXT}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify input file exists and show info
+        run: |
+          set -e
+          FILE="${{ steps.input.outputs.video_file }}"
+          if [ ! -s "$FILE" ]; then
+            echo "::error::ইনপুট ভিডিও ফাইল খালি অথবা ডাউনলোড/কপি ব্যর্থ হয়েছে: $FILE"
+            exit 1
+          fi
+          echo "----- Source Video Info -----"
+          ffprobe -v error \
+            -show_entries stream=width,height,r_frame_rate,avg_frame_rate,codec_name,pix_fmt \
+            -show_entries format=duration,size \
+            -of default=noprint_wrappers=1 \
+            "$FILE"
+
+      - name: Export video to true 4K (3840x2160, frame-accurate)
+        id: export
+        run: |
+          set -e
+          FILE="${{ steps.input.outputs.video_file }}"
+
+          OUTPUT_NAME="${{ github.event.inputs.output_name }}"
+          if [ -z "$OUTPUT_NAME" ]; then OUTPUT_NAME="output_4k"; fi
+
+          CRF="${{ github.event.inputs.crf }}"
+          if [ -z "$CRF" ]; then CRF="18"; fi
+
+          mkdir -p output
+          OUT_PATH="output/${OUTPUT_NAME}.mp4"
+
+          # মূল ফ্রেমরেট বের করা (frame-to-frame রাখার জন্য, fps পরিবর্তন করা হবে না)
+          SRC_FPS_RAW="$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 "$FILE")"
+
+          echo "▶ 4K (3840x2160) এ এক্সপোর্ট শুরু হচ্ছে..."
+          echo "  Source FPS: $SRC_FPS_RAW"
+          echo "  Output: $OUT_PATH (CRF=$CRF)"
+
+          # scale + pad → আসল aspect ratio বিকৃত না করেই ফুল 3840x2160 ফ্রেমে বসানো হবে
+          # -r দেওয়া হচ্ছে না, তাই সোর্সের আসল ফ্রেমরেট অপরিবর্তিত থাকবে (frame-to-frame accurate)
+          ffmpeg -y -i "$FILE" \
+            -vf "scale=3840:2160:force_original_aspect_ratio=decrease:flags=lanczos,pad=3840:2160:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1" \
+            -c:v libx264 -preset slow -crf "$CRF" -profile:v high -level 5.1 -pix_fmt yuv420p \
+            -c:a aac -b:a 192k -ar 48000 \
+            -movflags +faststart \
+            "$OUT_PATH"
+
+          if [ ! -s "$OUT_PATH" ]; then
+            echo "::error::এক্সপোর্ট ব্যর্থ হয়েছে, আউটপুট ফাইল তৈরি হয়নি।"
+            exit 1
+          fi
+
+          echo "----- Output Video Info -----"
+          ffprobe -v error \
+            -show_entries stream=width,height,r_frame_rate,codec_name,pix_fmt \
+            -show_entries format=duration,size \
+            -of default=noprint_wrappers=1 \
+            "$OUT_PATH"
+
+          echo "output_path=$OUT_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload 4K video as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 4k-exported-video
+          path: output/*.mp4
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Commit exported video back to repo
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/*.mp4
+          if git diff --cached --quiet; then
+            echo "কমিট করার মতো নতুন কোনো পরিবর্তন নেই।"
+          else
+            git commit -m "Add/update 4K exported video: ${{ github.event.inputs.output_name }} [skip ci]"
+            git push
+          fi
