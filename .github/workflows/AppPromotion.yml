@@ -10,13 +10,24 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install ffmpeg and fontconfig
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fontconfig
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      - name: Install SolaimanLipi font system-wide
+        run: |
+          mkdir -p ~/.local/share/fonts
+          cp src/solaimanlipi.ttf ~/.local/share/fonts/
+          fc-cache -f ~/.local/share/fonts
+
+          FONT_FAMILY=$(fc-scan --format "%{family}\n" src/solaimanlipi.ttf | head -n1 | cut -d',' -f1)
+          echo "Detected font family: $FONT_FAMILY"
+          fc-list | grep -i "solaiman" || echo "WARNING: font not showing in fc-list"
+          echo "FONT_FAMILY=$FONT_FAMILY" >> "$GITHUB_ENV"
 
       - name: Generate typewriter ASS subtitles
         run: |
@@ -30,6 +41,7 @@ jobs:
           TXT_PATH = os.path.join(SRC, "AppPromotion.txt")
           AUDIO_PATH = os.path.join(SRC, "AppVideo.mp3")
           ASS_PATH = "captions.ass"
+          FONT_FAMILY = os.environ.get("FONT_FAMILY", "SolaimanLipi").strip() or "SolaimanLipi"
 
           out = subprocess.run(
               ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -60,7 +72,7 @@ jobs:
           def escape_ass(text):
               return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
-          header = textwrap.dedent("""\
+          header_template = textwrap.dedent("""\
               [Script Info]
               Title: AppPromotion Typewriter
               ScriptType: v4.00+
@@ -71,11 +83,12 @@ jobs:
 
               [V4+ Styles]
               Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-              Style: Default,SolaimanLipi,95,&H00000000,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,100,100,320,1
+              Style: Default,{font},95,&H00000000,&H000000FF,&H00FFFFFF,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,100,100,850,1
 
               [Events]
               Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
               """)
+          header = header_template.format(font=FONT_FAMILY)
 
           lines = [header]
 
@@ -104,6 +117,7 @@ jobs:
           with open(ASS_PATH, "w", encoding="utf-8") as f:
               f.writelines(lines)
 
+          print("Font family used: {}".format(FONT_FAMILY))
           print("Audio duration: {:.2f}s, caption lines: {}".format(audio_duration, len(entries)))
           PYEOF
           python3 generate_captions.py
