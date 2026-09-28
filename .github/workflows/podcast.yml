@@ -16,6 +16,7 @@ env:
   PODCAST_NAME: "আমার পডকাস্ট"          # নিয়ন সাইনে যা দেখাবে
   EPISODE: "পর্ব ০১ | স্বাগতম"           # উপরের বাঁ কোণের ট্যাগ
   RECOGNIZER: "phonetic"                 # বাংলা = phonetic, ইংরেজি অডিও হলে pocketSphinx
+  MOUTH_SCALE: "0.78"                    # লিপসিংকের মুখের আকার: ১.০ = আগের মতো, আরও ছোট চাইলে 0.7, বড় চাইলে 0.85
 
 jobs:
   animate:
@@ -30,8 +31,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg espeak-ng unzip fonts-noto-core libraqm0 libfribidi0 libharfbuzz0b
-          pip install pillow numpy opencv-python-headless gTTS
+          sudo apt-get install -y ffmpeg espeak-ng unzip fonts-noto-core fonts-dejavu-core libraqm0 libfribidi0 libharfbuzz0b
+          pip install pillow numpy opencv-python-headless gTTS fonttools
 
       - name: Download Rhubarb Lip Sync
         run: |
@@ -41,9 +42,10 @@ jobs:
       - name: Render podcast video
         run: |
           cat > podcast.py <<'PYEOF'
-          import os, glob, json, math, random, re, shutil, subprocess, wave
+          import os, glob, json, math, random, re, shutil, subprocess, unicodedata, wave
           import numpy as np, cv2
           from PIL import Image, ImageDraw, ImageFont
+          from fontTools.ttLib import TTFont
 
           # ============================== সেটিংস (yml-এর env থেকে আসে) ==============================
           PODCAST_NAME = os.environ.get("PODCAST_NAME", "আমার পডকাস্ট")
@@ -53,6 +55,7 @@ jobs:
           BGM          = os.environ.get("BGM", "bgm.mp3")            # ঐচ্ছিক ব্যাকগ্রাউন্ড মিউজিক
           RECOGNIZER   = os.environ.get("RECOGNIZER", "phonetic")    # বাংলা/অন্য ভাষা: phonetic | ইংরেজি: pocketSphinx
           OUT          = os.environ.get("OUT", "podcast.mp4")
+          MOUTH_SCALE  = float(os.environ.get("MOUTH_SCALE", "0.78"))   # মুখ কতটা ছোট দেখাবে (১.০ = আগের মতো, কম = ছোট)
           W, H, FPS = 1280, 720, 24
 
           # ============================== ১) অডিও (না থাকলে ডেমো বাংলা অডিও বানায়) ==============================
@@ -93,6 +96,10 @@ jobs:
               v = 0.0
               for x in s.strip().split(":"): v = v * 60 + float(x)
               return v
+          # timestamps.txt-এ যেকোনো নাম দিতে পারেন; নিচের নামগুলো ৪টি মূল expression-এ মিলিয়ে নেওয়া হয়
+          EX_ALIAS = {"respectful": "neutral", "calm": "neutral", "informative": "neutral", "serious": "neutral", "sad": "neutral",
+                      "excited": "happy", "enthusiastic": "happy", "joy": "happy", "smile": "happy",
+                      "irritated": "angry", "shocked": "surprised", "surprise": "surprised"}
           segs = []
           if os.path.exists(TIMESTAMPS):
               for ln in open(TIMESTAMPS, encoding="utf-8-sig"):
@@ -100,7 +107,7 @@ jobs:
                   if not ln or ln.startswith("#"): continue
                   p = [x.strip() for x in ln.split("|")]
                   if len(p) < 3: continue
-                  segs.append(dict(s=tsec(p[0]), e=tsec(p[1]), text=p[2], ex=(p[3].lower() if len(p) > 3 and p[3] else "neutral")))
+                  segs.append(dict(s=tsec(p[0]), e=tsec(p[1]), text=p[2], ex=EX_ALIAS.get(p[3].lower(), p[3].lower()) if len(p) > 3 and p[3] else "neutral"))
           print("সংলাপের অংশ:", len(segs), "| অডিও দৈর্ঘ্য: %.1fs" % dur)
 
           # ============================== ২) Lip-sync cues (Rhubarb) ==============================
@@ -143,13 +150,18 @@ jobs:
           for _i in range(1, _n2):     # মাথার উপরের ছোট বিচ্ছিন্ন সাদা দাগ (চুলের ফাঁক) ব্যাকগ্রাউন্ড ধরা হবে
               if _i not in _edge and _st[_i, 4] < 500 and _cen[_i][1] < 330 and 430 < _cen[_i][0] < 850: bgm_ |= (_lab2 == _i)
           body[bgm_] = 255
-          CX0, CY0, CX1, CY1 = 240, 20, 1040, 920; CW, CH = CX1 - CX0, CY1 - CY0
+          CX0, CY0, CX1, CY1 = 100, 20, 1180, 980; CW, CH = CX1 - CX0, CY1 - CY0     # কাঁধ ও বাহু সম্পূর্ণ দেখাতে চওড়া crop (আগে 240-1040 ছিল)
           base = body[CY0:CY1, CX0:CX1].copy(); pm = (~bgm_[CY0:CY1, CX0:CX1]).astype(np.uint8)
           # কিনারার সাদা আভা (halo) সরানো
           band = (cv2.dilate(pm, np.ones((9, 9), np.uint8)) & ~cv2.erode(pm, np.ones((5, 5), np.uint8))) > 0
           base = cv2.inpaint(base, band.astype(np.uint8) * 255, 3, cv2.INPAINT_TELEA)
           alpha = cv2.GaussianBlur(pm.astype(np.float32), (0, 0), .8)
           def M(v): m = np.array([[v[0], v[1], v[2]], [v[3], v[4], v[5]]], np.float64); m[:, 2] -= (CX0, CY0); return m
+          MCX, MCY = 640 - CX0, 512 - CY0        # মুখের কেন্দ্র (crop-এর ভেতরের স্থানাঙ্ক)
+          def shrink(v, s_):                     # viseme ছবিকে মুখের কেন্দ্র ধরে ছোট করে (s_ < 1 = ছোট মুখ)
+              m = M(v); S_ = np.array([[s_, 0, MCX * (1 - s_)], [0, s_, MCY * (1 - s_)], [0, 0, 1]], np.float64)
+              return (S_ @ np.vstack([m, [0, 0, 1]]))[:2]
+          VSCALE = {"A": .78, "E": .86, "O": .88, "U": .92, "I": .95, "M": 1., "F": .92, "L": .92, "REST": 1.}   # হা-করা আকারগুলো বেশি ছোট
           MV = {"A": (0.7087, 0.0037, 385.3856, -0.0037, 0.7087, 316.2662), "E": (0.7087, 0.0037, -37.0515, -0.0037, 0.7087, 296.895),
                 "I": (0.7087, 0.0037, -469.8417, -0.0037, 0.7087, 314.1024), "O": (0.7087, 0.0037, 385.8113, -0.0037, 0.7087, 67.2622),
                 "U": (0.7087, 0.0037, -42.0525, -0.0037, 0.7087, 69.6043), "M": (0.7087, 0.0037, -467.2179, -0.0037, 0.7087, 56.0688),
@@ -165,11 +177,25 @@ jobs:
                    "angry": soft(rect(490, 302, 792, 426), 7), "surprised": soft(rect(490, 296, 792, 426), 7)}
           def bb(m): ys, xs = np.where(m[..., 0] > .003); return ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
           MB = bb(mouth_mask); EB = (292 - CY0, 428 - CY0, 490 - CX0, 792 - CX0)
-          def warp(src, mtx): return cv2.warpAffine(src, M(mtx), (CW, CH), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255)).astype(np.float32)
-          MOUTH = {k_: warp(vis, v)[MB[0]:MB[1], MB[2]:MB[3]] for k_, v in MV.items()}
+          def warpM(src, m): return cv2.warpAffine(src, m, (CW, CH), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255)).astype(np.float32)
+          def warp(src, mtx): return warpM(src, M(mtx))
+          MOUTH = {k_: warpM(vis, shrink(v, MOUTH_SCALE * VSCALE[k_]))[MB[0]:MB[1], MB[2]:MB[3]] for k_, v in MV.items()}
           EYES = {k_: warp(expr, v)[EB[0]:EB[1], EB[2]:EB[3]] for k_, v in ME.items()}
           EM = {k_: v[EB[0]:EB[1], EB[2]:EB[3]] for k_, v in EMASK.items()}
           MM = mouth_mask[MB[0]:MB[1], MB[2]:MB[3]]
+          # viseme ছবি ছোট করলে ঘরের (cell) সাদা কিনারা মুখের উপর চলে আসে; তাই প্রতিটি viseme-র "বৈধ এলাকা" বানিয়ে শুধু সেখানেই বসানো হয়
+          VCELL = {"A": (0, 0), "E": (0, 1), "I": (0, 2), "O": (1, 0), "U": (1, 1), "M": (1, 2), "F": (2, 0), "L": (2, 1), "REST": (2, 2)}
+          VCOL, VROW = [(72, 640), (675, 1243), (1278, 1846)], [(148, 436), (503, 786), (853, 1136)]
+          _wn, _wl = cv2.connectedComponents((vis.min(axis=2) > 225).astype(np.uint8))
+          _wb = set(np.unique(np.concatenate([_wl[0], _wl[-1], _wl[:, 0], _wl[:, -1]]))) - {0}
+          VBG = cv2.dilate(np.isin(_wl, list(_wb)).astype(np.uint8), np.ones((7, 7), np.uint8))      # chart-এর সাদা ব্যাকগ্রাউন্ড (দাঁত ভেতরের সাদা এতে পড়ে না)
+          def valid_mask(k_):
+              r_, c_ = VCELL[k_]; m = np.zeros(vis.shape[:2], np.uint8); ins = 8
+              m[VROW[r_][0] + ins:VROW[r_][1] - ins, VCOL[c_][0] + ins:VCOL[c_][1] - ins] = 255
+              m[VBG > 0] = 0
+              w = cv2.warpAffine(m, shrink(MV[k_], MOUTH_SCALE * VSCALE[k_]), (CW, CH), flags=cv2.INTER_LINEAR, borderValue=0)
+              return (cv2.GaussianBlur(w, (0, 0), 2.5).astype(np.float32) / 255)[MB[0]:MB[1], MB[2]:MB[3], None]
+          MMV = {k_: MM * valid_mask(k_) for k_ in MV}
           basef = base.astype(np.float32); P4 = np.dstack([basef, alpha])
           YY, XX = np.mgrid[0:CH, 0:CW].astype(np.float32); wgt = np.clip((CH - 20 - YY) / 480., 0, 1); wgt = wgt * wgt * (3 - 2 * wgt)
           PX, PY = CW / 2, CH - 20
@@ -180,12 +206,52 @@ jobs:
           SC = 0.66; PW, PH = int(CW * SC), int(CH * SC); PX0, PY0 = 640 - PW // 2, 22
 
           # ============================== ৪) ফন্ট ও বাংলা টেক্সট ==============================
-          def bfont(size, bold=False):
-              cand = ["/usr/share/fonts/truetype/noto/NotoSansBengali-%s.ttf" % ("Bold" if bold else "Regular")] + glob.glob("/usr/share/fonts/**/*Bengali*.ttf", recursive=True)
-              for p in cand:
-                  try: return ImageFont.truetype(p, size, layout_engine=ImageFont.Layout.RAQM)
-                  except Exception: pass
-              return ImageFont.load_default()
+          _CMAPS = {}
+          def _cmap(p):
+              if p not in _CMAPS:
+                  try: _CMAPS[p] = set(TTFont(p, lazy=True).getBestCmap().keys())
+                  except Exception: _CMAPS[p] = None
+              return _CMAPS[p]
+          def _bn_path(bold):
+              c = sorted(glob.glob("/usr/share/fonts/**/*Bengali*.ttf", recursive=True)); c = [p for p in c if "UI" not in os.path.basename(p)] or c
+              want = "-Bold.ttf" if bold else "-Regular.ttf"; ex_ = [p for p in c if p.endswith(want)]
+              return (ex_ or c or [None])[0]
+          def _fallback_paths(bold):
+              # বাংলা ফন্টে যে অক্ষর (যেমন ❝ ❞ ও ইংরেজি S2) নেই, সেগুলো এই ফন্টগুলো থেকে আসবে
+              n = "Bold" if bold else "Regular"
+              return [p for p in [f"/usr/share/fonts/truetype/noto/NotoSans-{n}.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                                  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"] if os.path.exists(p)]
+          class FS:      # একাধিক ফন্টের সেট: প্রতিটি অক্ষর প্রথম যে ফন্টে গ্লিফ আছে সেটা দিয়ে আঁকা হয় (বক্স/টোফু আসে না)
+              def __init__(self, size, bold=False):
+                  self.fonts, self.cmaps = [], []
+                  for p in [_bn_path(bold)] + _fallback_paths(bold):
+                      if not p: continue
+                      try: f = ImageFont.truetype(p, size, layout_engine=ImageFont.Layout.RAQM)
+                      except Exception: continue
+                      self.fonts.append(f); self.cmaps.append(_cmap(p))
+                  if not self.fonts: self.fonts, self.cmaps = [ImageFont.load_default()], [None]
+              def pick(self, ch):
+                  o = ord(ch)
+                  if 0x0980 <= o <= 0x09FF: return 0                      # বাংলা ব্লক সবসময় বাংলা ফন্টে
+                  for i, cm in enumerate(self.cmaps):
+                      if cm is None or o in cm: return i
+                  return 0
+              def runs(self, text):
+                  out = []
+                  for ch in text:
+                      if out and (ch.isspace() or ord(ch) in (0x200C, 0x200D) or unicodedata.combining(ch)): i = out[-1][0]   # স্পেস/যুক্ত চিহ্ন আগের অংশের সাথে
+                      else: i = self.pick(ch)
+                      if out and out[-1][0] == i: out[-1][1] += ch
+                      else: out.append([i, ch])
+                  return out
+          def bfont(size, bold=False): return FS(size, bold)
+          def tlen(text, fs): return sum(fs.fonts[i].getlength(seg) for i, seg in fs.runs(text))
+          def draw_rt(dr, x, y, text, fs, fill, anchor="lm"):      # anchor: প্রথম অক্ষর l/m (বাঁ/মাঝ), দ্বিতীয় m/a (উলম্ব মাঝ/উপর)
+              w = tlen(text, fs); asc, desc = fs.fonts[0].getmetrics()
+              cx = x - w / 2 if anchor[0] == "m" else x
+              base = y - (asc + desc) / 2 + asc if anchor[1] == "m" else y + asc
+              for i, seg in fs.runs(text):
+                  dr.text((cx, base), seg, font=fs.fonts[i], fill=fill, anchor="ls"); cx += fs.fonts[i].getlength(seg)
           def efont(size):
               try: return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
               except Exception: return ImageFont.load_default()
@@ -258,10 +324,10 @@ jobs:
               gl = cv2.GaussianBlur(rgb * al, (0, 0), blur); return rgb, al, gl
           NX0, NY0, NW, NH = 930, 70, 330, 150
           def neon_draw(dr):
-              f = bfont(46, True); tw = dr.textlength(PODCAST_NAME, font=f)
-              if tw > NW - 40: f = bfont(int(46 * (NW - 40) / tw), True); tw = dr.textlength(PODCAST_NAME, font=f)
+              f = bfont(46, True); tw = tlen(PODCAST_NAME, f)
+              if tw > NW - 40: f = bfont(int(46 * (NW - 40) / tw), True); tw = tlen(PODCAST_NAME, f)
               dr.rounded_rectangle((8, 12, NW - 8, NH - 12), 22, outline=(255, 90, 200, 255), width=4)
-              dr.text(((NW - tw) / 2, 34), PODCAST_NAME, font=f, fill=(255, 210, 245, 255))
+              draw_rt(dr, (NW - tw) / 2, 34, PODCAST_NAME, f, (255, 210, 245, 255), "la")
               dr.line((60, NH - 34, NW - 60, NH - 34), fill=(80, 220, 255, 255), width=4)
           N_RGB, N_A, N_GL = glow_layer((NW, NH), neon_draw, 9)
           OX0, OY0, OW, OH = 1010, 470, 170, 56
@@ -282,18 +348,18 @@ jobs:
               out, cur = [], ""
               for wd in text.split():
                   t_ = (cur + " " + wd).strip()
-                  if dr.textlength(t_, font=f) > maxw and cur: out.append(cur); cur = wd
+                  if tlen(t_, f) > maxw and cur: out.append(cur); cur = wd
                   else: cur = t_
               return out + [cur]
           CAPF = bfont(29); tmpd = ImageDraw.Draw(Image.new("RGB", (10, 10)))
           def cap_img(text):
-              lines = wrap(tmpd, text, CAPF, 980); lh = 46; w_ = int(max(tmpd.textlength(l, font=CAPF) for l in lines)) + 56; h_ = lh * len(lines) + 18
+              lines = wrap(tmpd, text, CAPF, 980); lh = 46; w_ = int(max(tlen(l, CAPF) for l in lines)) + 56; h_ = lh * len(lines) + 18
               im = Image.new("RGBA", (w_, h_), (0, 0, 0, 0)); dr = ImageDraw.Draw(im); dr.rounded_rectangle((0, 0, w_ - 1, h_ - 1), 18, fill=(12, 12, 26, 205))
-              for i_, l in enumerate(lines): dr.text((w_ / 2, 9 + lh * i_ + lh / 2 - 2), l, font=CAPF, fill=(255, 255, 255, 255), anchor="mm")
+              for i_, l in enumerate(lines): draw_rt(dr, w_ / 2, 9 + lh * i_ + lh / 2 - 2, l, CAPF, (255, 255, 255, 255), "mm")
               a = np.array(im).astype(np.float32); return cv2.cvtColor(a[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32), a[..., 3:4] / 255
           CAPS = [cap_img(s["text"]) for s in segs]
-          tf = bfont(24, True); tw_ = int(tmpd.textlength(EPISODE, font=tf)) + 44
-          ti = Image.new("RGBA", (tw_, 46), (0, 0, 0, 0)); td = ImageDraw.Draw(ti); td.rounded_rectangle((0, 0, tw_ - 1, 45), 22, fill=(220, 50, 90, 235)); td.ellipse((14, 17, 26, 29), fill=(255, 255, 255, 255)); td.text((36, 23), EPISODE, font=tf, fill=(255, 255, 255, 255), anchor="lm")
+          tf = bfont(24, True); tw_ = int(tlen(EPISODE, tf)) + 44
+          ti = Image.new("RGBA", (tw_, 46), (0, 0, 0, 0)); td = ImageDraw.Draw(ti); td.rounded_rectangle((0, 0, tw_ - 1, 45), 22, fill=(220, 50, 90, 235)); td.ellipse((14, 17, 26, 29), fill=(255, 255, 255, 255)); draw_rt(td, 36, 23, EPISODE, tf, (255, 255, 255, 255), "lm")
           ta = np.array(ti).astype(np.float32); T_RGB = cv2.cvtColor(ta[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32); T_A = ta[..., 3:4] / 255
           def put(canvas, rgb, a, x0, y0, k=1.0):
               h_, w_ = a.shape[:2]; x0 = int(x0); y0 = int(y0); r = canvas[y0:y0 + h_, x0:x0 + w_]; aa = a * k; r[:] = r * (1 - aa) + rgb * aa
@@ -316,6 +382,7 @@ jobs:
           else: cmd += ["-map", "0:v", "-map", "1:a", "-af", "apad"]
           ff = subprocess.Popen(cmd + ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-t", "%.3f" % (NF / FPS), OUT], stdin=subprocess.PIPE)
           prev_seg = -1
+          mw = {k_: 0. for k_ in MMV}; mw["REST"] = 1.        # viseme-র ওজন (দ্রুত বদলালে মুখ ঝাঁকি খায় না)
           for f in range(NF):
               tt = f / FPS; si = seg_at(tt)
               if si != prev_seg and si >= 0: seg_start = tt
@@ -329,7 +396,12 @@ jobs:
                   if w_ > .01: m_ = EM[k_] * w_; roi[:] = roi * (1 - m_) + EYES[k_] * m_
               b_ = blink_lvl(f)
               if b_ > 0: m_ = EM["closed"] * b_; roi[:] = roi * (1 - m_) + EYES["closed"] * m_
-              m0, m1, n0, n1 = MB; fr[m0:m1, n0:n1] = fr[m0:m1, n0:n1] * (1 - MM) + MOUTH[VIS_AT[f]] * MM
+              m0, m1, n0, n1 = MB
+              for k_ in mw: mw[k_] += ((1. if k_ == VIS_AT[f] else 0.) - mw[k_]) * .75
+              ws_ = sum(w_ for w_ in mw.values() if w_ > .02); A_ = 0.; C_ = 0.
+              for k_, w_ in mw.items():
+                  if w_ > .02: A_ = A_ + (w_ / ws_) * MMV[k_]; C_ = C_ + (w_ / ws_) * MMV[k_] * MOUTH[k_]
+              fr[m0:m1, n0:n1] = fr[m0:m1, n0:n1] * (1 - A_) + C_
               # শরীরের ভাষা: শ্বাস, বলার সময় মাথা দোলা, প্রতি অংশের শুরুতে নড
               nod = 0.
               if si >= 0 and tt - seg_start < .45: nod = math.sin(math.pi * (tt - seg_start) / .45)
