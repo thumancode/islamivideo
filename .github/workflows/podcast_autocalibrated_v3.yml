@@ -1,0 +1,1049 @@
+name: Animated Bangla Podcast — Auto Calibration v3
+
+# Repo-র root-এ এই ফাইলগুলো রাখুন:
+#   body.jpg         -> ক্যারেক্টারের full body ছবি
+#   visemes.jpg      -> Viseme mouth chart
+#   expressions.jpg  -> Expression / eye-blink chart
+#   audio.mp3        -> আপনার পডকাস্টের ভয়েস (না থাকলে ডেমো বাংলা অডিও বানানো হবে)
+#   timestamps.txt   -> প্রতি লাইনে: শুরু | শেষ | সংলাপ | expression
+#   bgm.mp3          -> (ঐচ্ছিক) ব্যাকগ্রাউন্ড মিউজিক, ১০% ভলিউমে মিশবে
+on:
+  workflow_dispatch:
+    inputs:
+      podcast_name:
+        description: "নিয়ন সাইনে Podcast name"
+        required: true
+        default: "আমার পডকাস্ট"
+      episode:
+        description: "উপরের বাঁ কোণের Episode tag"
+        required: true
+        default: "পর্ব ০১ | স্বাগতম"
+      recognizer:
+        description: "Rhubarb recognizer: phonetic বা pocketSphinx"
+        required: true
+        default: "phonetic"
+      mouth_scale:
+        description: "Viseme mouth scale: 1.0=স্বাভাবিক"
+        required: true
+        default: "0.78"
+      calibration_mode:
+        description: "Calibration: auto/manual/strict/off"
+        required: true
+        default: "auto"
+      calibration_preview:
+        description: "Create calibration preview image"
+        required: true
+        default: "true"
+      preview_only:
+        description: "Only generate calibration preview; skip video render"
+        required: true
+        default: "false"
+      fail_on_calibration_error:
+        description: "Stop before rendering if auto-calibration is unsafe"
+        required: true
+        default: "true"
+      calibration_tolerance:
+        description: "Allowed head-size/aspect mismatch percentage"
+        required: true
+        default: "0.25"
+      auto_measure:
+        description: "নতুন chart এ MV/ME auto re-measure করবে"
+        required: true
+        default: "true"
+      auto_gesture:
+        description: "Dialogue/timestamp থেকে gesture keyword ধরবে"
+        required: true
+        default: "true"
+      gesture_smooth:
+        description: "Hand gesture smoothing 0.05-0.50"
+        required: true
+        default: "0.20"
+      gesture_max_deg:
+        description: "Raised arm maximum rotation degree"
+        required: true
+        default: "68"
+      timestamps_file:
+        description: "Timestamp/gesture source file in repository"
+        required: true
+        default: "timestamps.txt"
+      gesture_file:
+        description: "Gesture timeline source; blank হলে timestamps_file ব্যবহার হবে"
+        required: true
+        default: ""
+  push:
+    branches: [main]
+
+env:
+  # workflow_dispatch থেকে edit করা যায়; push হলে এগুলো default হবে
+  PODCAST_NAME: ${{ github.event.inputs.podcast_name || 'আমার পডকাস্ট' }}
+  EPISODE: ${{ github.event.inputs.episode || 'পর্ব ০১ | স্বাগতম' }}
+  RECOGNIZER: ${{ github.event.inputs.recognizer || 'phonetic' }}
+  MOUTH_SCALE: ${{ github.event.inputs.mouth_scale || '0.78' }}
+
+  # ========================= PROFESSIONAL CALIBRATION =========================
+  AUTO_MEASURE: ${{ github.event.inputs.auto_measure || 'true' }}
+  CALIBRATION_MODE: ${{ github.event.inputs.calibration_mode || 'auto' }}
+  CALIBRATION_PREVIEW: ${{ github.event.inputs.calibration_preview || 'true' }}
+  PREVIEW_ONLY: ${{ github.event.inputs.preview_only || 'false' }}
+  FAIL_ON_CALIBRATION_ERROR: ${{ github.event.inputs.fail_on_calibration_error || 'true' }}
+  CALIBRATION_TOLERANCE: ${{ github.event.inputs.calibration_tolerance || '0.25' }}
+  AUTO_GESTURE: ${{ github.event.inputs.auto_gesture || 'true' }}
+  GESTURE_SMOOTH: ${{ github.event.inputs.gesture_smooth || '0.20' }}
+  GESTURE_MAX_DEG: ${{ github.event.inputs.gesture_max_deg || '68' }}
+  TIMESTAMPS_FILE: ${{ github.event.inputs.timestamps_file || 'timestamps.txt' }}
+  GESTURE_FILE: ${{ github.event.inputs.gesture_file || github.event.inputs.timestamps_file || 'timestamps.txt' }}
+  EXPRESSION_ROWS: "2"
+  EXPRESSION_COLS: "3"
+  VISEME_ROWS: "3"
+  VISEME_COLS: "3"
+  GENERATE_DEMO_TIMESTAMPS: "true"
+
+  # নতুন body/expressions chart দিলে target box দরকার হলে এখান থেকে edit করুন।
+  # format: x0,y0,x1,y1 — original body.jpg coordinate
+  BODY_HEAD_BOX: "389,72,895,500"
+  BODY_EYE_BOX: "490,292,792,428"
+  BODY_MOUTH_BOX: "520,437,760,593"
+
+  # Character-right = ছবির LEFT arm, Character-left = ছবির RIGHT arm.
+  # format: x0,y0,x1,y1 — original body.jpg coordinate
+  ARM_RIGHT_BOX: "275,300,455,900"
+  ARM_LEFT_BOX: "825,300,1005,900"
+  ARM_RIGHT_PIVOT: "390,350"
+  ARM_LEFT_PIVOT: "890,350"
+  ARM_MASK_WIDTH: "150"
+
+  # timestamps.txt:
+  # start | end | dialogue | expression | gesture | intensity | camera | notes
+  # gesture examples:
+  # none
+  # right:raise / left:raise / both:raise
+  # right:salute / left:salute
+  # right:salam / left:salam
+  # right:wave / left:wave / both:wave
+  # nod / bow
+  #
+  # gesture অংশে "auto" দিলে dialogue-এর keyword থেকেও gesture নেওয়া হবে।
+
+jobs:
+  animate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg espeak-ng unzip fonts-noto-core fonts-dejavu-core libraqm0 libfribidi0 libharfbuzz0b
+          python -m pip uninstall -y opencv-python opencv-contrib-python opencv-contrib-python-headless cv2 2>/dev/null || true
+          python -m pip install --upgrade --no-cache-dir pillow numpy opencv-python-headless==4.10.0.84 gTTS fonttools
+
+      - name: Download Rhubarb Lip Sync
+        run: |
+          curl -sL -o rhubarb.zip https://github.com/DanielSWolf/rhubarb-lip-sync/releases/download/v1.13.0/Rhubarb-Lip-Sync-1.13.0-Linux.zip
+          unzip -q rhubarb.zip
+
+      - name: Render podcast video
+        run: |
+          cat > podcast.py <<'PYEOF'
+          import os, glob, json, math, random, re, shutil, subprocess, unicodedata, wave
+          import numpy as np, cv2
+          from PIL import Image, ImageDraw, ImageFont
+          from fontTools.ttLib import TTFont
+          print('Auto-calibration runtime — OpenCV:', getattr(cv2, '__version__', 'unknown'), getattr(cv2, '__file__', 'unknown'))
+
+          # ============================== সেটিংস (yml-এর env থেকে আসে) ==============================
+          PODCAST_NAME = os.environ.get("PODCAST_NAME", "আমার পডকাস্ট")
+          EPISODE      = os.environ.get("EPISODE", "পর্ব ০১ | স্বাগতম")
+          AUDIO        = os.environ.get("AUDIO", "audio.mp3")
+          TIMESTAMPS   = os.environ.get("TIMESTAMPS_FILE", os.environ.get("GESTURE_FILE", os.environ.get("TIMESTAMPS", "timestamps.txt")))
+          BGM          = os.environ.get("BGM", "bgm.mp3")            # ঐচ্ছিক ব্যাকগ্রাউন্ড মিউজিক
+          RECOGNIZER   = os.environ.get("RECOGNIZER", "phonetic")    # বাংলা/অন্য ভাষা: phonetic | ইংরেজি: pocketSphinx
+          OUT          = os.environ.get("OUT", "podcast.mp4")
+          MOUTH_SCALE  = float(os.environ.get("MOUTH_SCALE", "0.78"))   # মুখ কতটা ছোট দেখাবে (১.০ = আগের মতো, কম = ছোট)
+          AUTO_MEASURE = os.environ.get("AUTO_MEASURE", "true").lower() == "true"
+          CALIBRATION_MODE = os.environ.get("CALIBRATION_MODE", "auto").lower()
+          if not AUTO_MEASURE and CALIBRATION_MODE in ("auto", "strict"):
+              CALIBRATION_MODE = "manual"
+          CALIBRATION_PREVIEW = os.environ.get("CALIBRATION_PREVIEW", "true").lower() == "true"
+          PREVIEW_ONLY = os.environ.get("PREVIEW_ONLY", "false").lower() == "true"
+          FAIL_ON_CALIBRATION_ERROR = os.environ.get("FAIL_ON_CALIBRATION_ERROR", "true").lower() == "true"
+          CALIBRATION_TOLERANCE = float(os.environ.get("CALIBRATION_TOLERANCE", "0.25"))
+          EXPRESSION_ROWS = int(os.environ.get("EXPRESSION_ROWS", "2")); EXPRESSION_COLS = int(os.environ.get("EXPRESSION_COLS", "3"))
+          VISEME_ROWS = int(os.environ.get("VISEME_ROWS", "3")); VISEME_COLS = int(os.environ.get("VISEME_COLS", "3"))
+          AUTO_GESTURE = os.environ.get("AUTO_GESTURE", "true").lower() == "true"
+          GESTURE_SMOOTH = float(os.environ.get("GESTURE_SMOOTH", "0.20"))
+          GESTURE_MAX_DEG = float(os.environ.get("GESTURE_MAX_DEG", "68"))
+          GESTURE_FILE = os.environ.get("GESTURE_FILE", TIMESTAMPS)
+          BODY_HEAD_BOX = tuple(map(int, os.environ.get("BODY_HEAD_BOX", "389,72,895,500").split(",")))
+          BODY_EYE_BOX = tuple(map(int, os.environ.get("BODY_EYE_BOX", "490,292,792,428").split(",")))
+          BODY_MOUTH_BOX = tuple(map(int, os.environ.get("BODY_MOUTH_BOX", "520,437,760,593").split(",")))
+          ARM_RIGHT_BOX = tuple(map(int, os.environ.get("ARM_RIGHT_BOX", "275,300,455,900").split(",")))
+          ARM_LEFT_BOX = tuple(map(int, os.environ.get("ARM_LEFT_BOX", "825,300,1005,900").split(",")))
+          ARM_RIGHT_PIVOT = tuple(map(int, os.environ.get("ARM_RIGHT_PIVOT", "390,350").split(",")))
+          ARM_LEFT_PIVOT = tuple(map(int, os.environ.get("ARM_LEFT_PIVOT", "890,350").split(",")))
+          ARM_MASK_WIDTH = int(os.environ.get("ARM_MASK_WIDTH", "150"))
+          W, H, FPS = 1280, 720, 24
+
+          # ============================== ১) অডিও (না থাকলে ডেমো বাংলা অডিও বানায়) ==============================
+          DEMO = [
+              ("আসসালামু আলাইকুম! আমার পডকাস্টে আপনাকে স্বাগতম।", "happy"),
+              ("আজকের বিষয় হলো, একজন অ্যান্ড্রয়েড ডেভেলপার কীভাবে অ্যানিমেশন দিয়ে আয় করতে পারে।", "neutral"),
+              ("এটা শুনে অনেকেই অবাক হন, কিন্তু এটা সম্ভব!", "surprised"),
+              ("তবে ধৈর্য আর নিয়মিত কাজ ছাড়া সফলতা আসে না।", "angry"),
+              ("চলুন, শুরু করা যাক!", "happy"),
+          ]
+          def make_demo():
+              SR = 22050; parts = [np.zeros(int(SR * .6), np.int16)]; t = .6; rows = []
+              for i, (txt, ex) in enumerate(DEMO):
+                  try:
+                      from gtts import gTTS
+                      gTTS(txt, lang="bn").save("d.mp3")
+                      subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", "d.mp3", "-ar", str(SR), "-ac", "1", f"d{i}.wav"], check=True)
+                  except Exception as e:
+                      print("gTTS নেই -> espeak-ng (bn):", e)
+                      subprocess.run(["espeak-ng", "-v", "bn", "-s", "135", "-w", f"r{i}.wav", txt], check=True)
+                      subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", f"r{i}.wav", "-ar", str(SR), "-ac", "1", f"d{i}.wav"], check=True)
+                  with wave.open(f"d{i}.wav") as w: a = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+                  d = len(a) / SR; rows.append(f"{t:.2f} | {t + d:.2f} | {txt} | {ex} | auto | 1.0 | default | demo")
+                  parts += [a, np.zeros(int(SR * .5), np.int16)]; t += d + .5
+              with wave.open("demo.wav", "wb") as w:
+                  w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR); w.writeframes(np.concatenate(parts).tobytes())
+              subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", "demo.wav", AUDIO], check=True)
+              if not os.path.exists(TIMESTAMPS) and os.environ.get("GENERATE_DEMO_TIMESTAMPS","true").lower()=="true":
+                  open(TIMESTAMPS, "w", encoding="utf-8").write("# শুরু | শেষ | সংলাপ | expression | gesture | intensity | camera | notes\n" + "\n".join(rows) + "\n")
+          if not os.path.exists(AUDIO):
+              print("audio.mp3 পাওয়া যায়নি -> ডেমো বানানো হচ্ছে"); make_demo()
+
+          subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", AUDIO, "-ar", "22050", "-ac", "1", "voice.wav"], check=True)
+          SR = 22050
+          with wave.open("voice.wav") as w: audio = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+          dur = len(audio) / SR; NF = int((dur + 0.6) * FPS) + 1
+
+          def tsec(s):
+              v = 0.0
+              for x in s.strip().split(":"): v = v * 60 + float(x)
+              return v
+          # timestamps.txt-এ যেকোনো নাম দিতে পারেন; নিচের নামগুলো ৪টি মূল expression-এ মিলিয়ে নেওয়া হয়
+          EX_ALIAS = {"respectful": "neutral", "calm": "neutral", "informative": "neutral", "serious": "neutral", "sad": "neutral",
+                      "excited": "happy", "enthusiastic": "happy", "joy": "happy", "smile": "happy",
+                      "irritated": "angry", "shocked": "surprised", "surprise": "surprised"}
+
+          # Timestamp format:
+          # start | end | dialogue | expression | gesture | intensity | camera | notes
+          # পুরনো 4-column format-ও পুরোপুরি কাজ করবে।
+          GESTURE_ALIAS = {
+              "none": "none", "rest": "none", "idle": "none",
+              "raise": "right:raise", "hand_up": "right:raise", "handup": "right:raise",
+              "salute": "right:salute", "salam": "right:salam", "wave": "right:wave",
+              "right_raise": "right:raise", "left_raise": "left:raise", "both_raise": "both:raise",
+              "right_salute": "right:salute", "left_salute": "left:salute",
+              "right_salam": "right:salam", "left_salam": "left:salam",
+              "right_wave": "right:wave", "left_wave": "left:wave", "both_wave": "both:wave",
+              "nod": "nod", "bow": "bow"
+          }
+
+          def infer_gesture(text):
+              if not AUTO_GESTURE: return "none"
+              t = re.sub(r"\s+", " ", text.lower())
+              side = "both" if ("দুই হাত" in t or "উভয় হাত" in t or "উভয় হাত" in t or "both hand" in t) else                      "right" if ("ডান হাত" in t or "right hand" in t) else                      "left" if ("বাম হাত" in t or "বাঁ হাত" in t or "left hand" in t) else "right"
+              if any(k in t for k in ["স্যালুট", "salute"]):
+                  return side + ":salute"
+              # "আসসালামু আলাইকুম" যেন ভুল করে hand gesture না চালায়।
+              if any(k in t for k in ["হাত দিয়ে সালাম", "হাত দিয়ে সালাম", "সালাম দিব", "সালাম দেবে", "সালাম দিচ্ছে", "সালাম করুন", "salam gesture"]):
+                  return side + ":salam"
+              if any(k in t for k in ["হাত নাড়", "হাত নাড়", "হাত নেড়ে", "হাত নেড়ে", "wave hand", "wave"]):
+                  return side + ":wave"
+              if any(k in t for k in ["হাত উঠ", "হাত তুল", "হাত তোলে", "হাত তুলবে", "raise hand", "hand up"]):
+                  return side + ":raise"
+              if "মাথা নাড়" in t or "মাথা নাড়" in t or "nod" in t:
+                  return "nod"
+              if "ঝুঁকে" in t or "নতমস্তক" in t or "bow" in t:
+                  return "bow"
+              return "none"
+
+          def normalize_gesture(raw, text):
+              raw = (raw or "").strip().lower()
+              if not raw or raw == "auto":
+                  return infer_gesture(text)
+              raw = raw.replace(" ", "_")
+              if raw in GESTURE_ALIAS: return GESTURE_ALIAS[raw]
+              # Accept: right:raise, left:salute, both:wave, nod, bow
+              return raw
+
+          segs = []
+          if os.path.exists(TIMESTAMPS):
+              for ln in open(TIMESTAMPS, encoding="utf-8-sig"):
+                  ln = ln.strip()
+                  if not ln or ln.startswith("#"): continue
+                  p = [x.strip() for x in ln.split("|")]
+                  if len(p) < 3: continue
+                  ex = EX_ALIAS.get(p[3].lower(), p[3].lower()) if len(p) > 3 and p[3] else "neutral"
+                  try: intensity = max(0.0, min(1.0, float(p[5]))) if len(p) > 5 and p[5] else 1.0
+                  except Exception: intensity = 1.0
+                  segs.append(dict(
+                      s=tsec(p[0]), e=tsec(p[1]), text=p[2], ex=ex,
+                      gesture=normalize_gesture(p[4] if len(p) > 4 else "auto", p[2]),
+                      intensity=intensity,
+                      camera=(p[6].lower() if len(p) > 6 and p[6] else "default"),
+                      notes=(p[7] if len(p) > 7 else "")
+                  ))
+          print("সংলাপের অংশ:", len(segs), "| অডিও দৈর্ঘ্য: %.1fs" % dur)
+          print("Gesture timeline:", [(round(s["s"],2), round(s["e"],2), s["gesture"], s["intensity"]) for s in segs])
+          with open("gesture_timeline.txt", "w", encoding="utf-8") as _gf:
+              _gf.write("# start | end | gesture | intensity | dialogue\n")
+              for _s in segs:
+                  _gf.write(f"{_s['s']:.2f} | {_s['e']:.2f} | {_s['gesture']} | {_s['intensity']:.2f} | {_s['text']}\n")
+
+          # ============================== ২) Lip-sync cues (Rhubarb) ==============================
+          cues = None
+          rb = shutil.which("rhubarb") or next(iter(glob.glob("Rhubarb*/rhubarb")), None)
+          if rb:
+              try:
+                  r = subprocess.run([rb, "-q", "-f", "json", "-r", RECOGNIZER, "voice.wav"], capture_output=True, text=True, check=True)
+                  cues = json.loads(r.stdout)["mouthCues"]
+              except Exception as e: print("rhubarb ব্যর্থ:", e)
+          x_ = audio.astype(np.float32) / 32768; hop = SR // FPS
+          lv = np.array([np.sqrt(np.mean(x_[i*hop:(i+1)*hop] ** 2) + 1e-9) if len(x_[i*hop:(i+1)*hop]) else 1e-4 for i in range(NF)]); lv = lv / (np.percentile(lv, 92) + 1e-6)
+          if cues is None:
+              cues = [{"start": i / FPS, "end": (i + 1) / FPS, "value": "X" if v < .12 else "B" if v < .4 else "C" if v < .75 else "D"} for i, v in enumerate(lv)]
+          MAP = {"A": "M", "B": "I", "C": "E", "D": "A", "E": "O", "F": "U", "G": "F", "H": "L", "X": "REST"}
+          VIS_AT, k = [], 0
+          for f in range(NF):
+              tt = f / FPS + .02
+              while k < len(cues) - 1 and cues[k]["end"] <= tt: k += 1
+              VIS_AT.append(MAP[cues[k]["value"]] if cues[k]["start"] <= tt < cues[k]["end"] else "REST")
+          env, e_ = np.zeros(NF), 0.0
+          for i, v in enumerate(np.clip(lv, 0, 1.3)): e_ += (v - e_) * (.5 if v > e_ else .2); env[i] = e_
+
+          # audio spectrum for the equalizer wall-screen
+          NB = 26; edges = np.geomspace(90, 7500, NB + 1); spec = np.zeros((NF, NB), np.float32); fr_ax = np.fft.rfftfreq(2048, 1 / SR); hann = np.hanning(2048)
+          xp = np.pad(x_, (1024, 1024 + 4096 + SR))
+          for i in range(NF):
+              c = int(i / FPS * SR); m = np.abs(np.fft.rfft(xp[c:c + 2048] * hann))
+              spec[i] = [m[(fr_ax >= edges[j]) & (fr_ax < edges[j + 1])].mean() if ((fr_ax >= edges[j]) & (fr_ax < edges[j + 1])).any() else 0 for j in range(NB)]
+          spec = np.log1p(spec * 40); spec /= (np.percentile(spec, 97) + 1e-6)
+          for i in range(1, NF): spec[i] = np.maximum(spec[i], spec[i - 1] * .8)      # smooth decay
+          spec = np.clip(spec, 0, 1)
+
+          # ============================== ৩) ক্যারেক্টার লেয়ার ==============================
+          body = cv2.imread("body.jpg"); vis = cv2.imread("visemes.jpg"); expr = cv2.imread("expressions.jpg")
+          _n, _lab = cv2.connectedComponents((body.min(axis=2) > 226).astype(np.uint8))
+          _edge = set(np.unique(np.concatenate([_lab[0], _lab[:, 0], _lab[:, -1]]))) - {0}
+          bgm_ = np.isin(_lab, list(_edge))
+          _n2, _lab2, _st, _cen = cv2.connectedComponentsWithStats((body.min(axis=2) > 226).astype(np.uint8))
+          for _i in range(1, _n2):     # মাথার উপরের ছোট বিচ্ছিন্ন সাদা দাগ (চুলের ফাঁক) ব্যাকগ্রাউন্ড ধরা হবে
+              if _i not in _edge and _st[_i, 4] < 500 and _cen[_i][1] < 330 and 430 < _cen[_i][0] < 850: bgm_ |= (_lab2 == _i)
+          body[bgm_] = 255
+          CX0, CY0, CX1, CY1 = 100, 20, 1180, 980; CW, CH = CX1 - CX0, CY1 - CY0     # কাঁধ ও বাহু সম্পূর্ণ দেখাতে চওড়া crop (আগে 240-1040 ছিল)
+          base = body[CY0:CY1, CX0:CX1].copy(); pm = (~bgm_[CY0:CY1, CX0:CX1]).astype(np.uint8)
+          # কিনারার সাদা আভা (halo) সরানো
+          band = (cv2.dilate(pm, np.ones((9, 9), np.uint8)) & ~cv2.erode(pm, np.ones((5, 5), np.uint8))) > 0
+          base = cv2.inpaint(base, band.astype(np.uint8) * 255, 3, cv2.INPAINT_TELEA)
+          alpha = cv2.GaussianBlur(pm.astype(np.float32), (0, 0), .8)
+          # ============================== ৩A) 2D arm/hand gesture rig ==============================
+          # Character-right = source image-এর LEFT arm; Character-left = source image-এর RIGHT arm.
+          # Gesture is timestamp-driven, smooth, and independently editable.
+          def _crop_pt(pt):
+              return (int(pt[0] - CX0), int(pt[1] - CY0))
+
+          def _arm_mask(side):
+              box = ARM_RIGHT_BOX if side == "right" else ARM_LEFT_BOX
+              piv = ARM_RIGHT_PIVOT if side == "right" else ARM_LEFT_PIVOT
+              x0, y0, x1, y1 = box
+              px, py = _crop_pt(piv)
+              wx, wy = _crop_pt(((x0 + x1) / 2, y1 - 45))
+              m = np.zeros((CH, CW), np.uint8)
+              cv2.line(m, (px, py), (wx, wy), 255, ARM_MASK_WIDTH, cv2.LINE_AA)
+              cv2.ellipse(m, (wx, wy), (ARM_MASK_WIDTH // 2 + 8, ARM_MASK_WIDTH // 2 + 8), 0, 0, 360, 255, -1)
+              # Keep the mask inside the configured arm box.
+              clip = np.zeros_like(m); cv2.rectangle(clip, (x0-CX0, y0-CY0), (x1-CX0, y1-CY0), 255, -1)
+              m = cv2.bitwise_and(m, clip)
+              return cv2.GaussianBlur(m, (0, 0), 3.0).astype(np.float32) / 255.0
+
+          ARM_MASKS = {"right": _arm_mask("right"), "left": _arm_mask("left")}
+
+          def _gesture_angle(side, action, intensity, phase):
+              sign = 1.0 if side == "right" else -1.0
+              a = action.lower()
+              base = 0.0
+              wave = 0.0
+              if a == "raise": base = GESTURE_MAX_DEG
+              elif a == "salute": base = min(78.0, GESTURE_MAX_DEG + 8.0)
+              elif a == "salam": base = min(58.0, GESTURE_MAX_DEG * .86); wave = 10.0 * math.sin(phase * math.pi * 4.0)
+              elif a == "wave": base = min(60.0, GESTURE_MAX_DEG * .88); wave = 18.0 * math.sin(phase * math.pi * 4.0)
+              else: return 0.0
+              return sign * (base + wave) * max(0.0, min(1.0, intensity))
+
+          def apply_one_arm(img, aimg, side, action, intensity, phase, state):
+              target = _gesture_angle(side, action, intensity, phase)
+              old = state.get(side, 0.0)
+              cur = old + (target - old) * max(.01, min(.9, GESTURE_SMOOTH))
+              state[side] = cur
+              if abs(cur) < .25: return img, aimg
+              mask = ARM_MASKS[side]
+              if mask.max() < .05: return img, aimg
+              piv = ARM_RIGHT_PIVOT if side == "right" else ARM_LEFT_PIVOT
+              center = _crop_pt(piv)
+              R = cv2.getRotationMatrix2D(center, cur, 1.0)
+              src = np.clip(img, 0, 255).astype(np.uint8)
+              am = np.clip(aimg * 255, 0, 255).astype(np.uint8)
+              mk = np.clip(mask * 255, 0, 255).astype(np.uint8)
+              # Remove the original arm softly, then place the rotated cutout.
+              cleaned = cv2.inpaint(src, mk, 5, cv2.INPAINT_TELEA).astype(np.float32)
+              clean_a = cv2.inpaint(am, mk, 5, cv2.INPAINT_TELEA).astype(np.float32) / 255.0
+              cut = src.astype(np.float32) * mask[..., None]
+              cut_a = (am.astype(np.float32) / 255.0) * mask
+              rc = cv2.warpAffine(cut, R, (CW, CH), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+              ra = cv2.warpAffine(cut_a, R, (CW, CH), flags=cv2.INTER_LINEAR, borderValue=0)
+              edge = cv2.GaussianBlur(np.clip(ra, 0, 1), (0, 0), 1.2)
+              out = cleaned * (1 - edge[..., None]) + rc * edge[..., None]
+              out_a = clean_a * (1 - edge) + edge
+              return out, out_a
+
+          def apply_gesture_rig(img, aimg, action, intensity, phase, state):
+              act = (action or "none").lower().strip()
+              if act in ("none", "rest", ""): return img, aimg
+              if act in ("nod", "bow"): return img, aimg
+              if ":" in act:
+                  side, verb = act.split(":", 1)
+              else:
+                  side, verb = "right", act
+              sides = ["right", "left"] if side == "both" else [side]
+              for sd in sides:
+                  if sd in ("right", "left"):
+                      img, aimg = apply_one_arm(img, aimg, sd, verb, intensity, phase, state)
+              return img, aimg
+
+          # ============================== 3B) AUTO-CALIBRATION ==============================
+          # This replaces the previous fixed MV/ME matrices. The body face is detected from
+          # body.jpg; each expression face is detected in its grid cell; each viseme is extracted
+          # from its grid cell and fitted into the measured body mouth target.
+          def _skin_component_boxes(img, min_size=40):
+              """
+              Dependency-free face/skin geometry detector for illustrated/anime assets.
+              IMPORTANT: do not use cv2.CascadeClassifier here. Some GitHub runners can
+              expose a minimal/conflicting cv2 build where CascadeClassifier is unavailable.
+              """
+              hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+              # Broad warm-skin range; the supplied character is an illustration, not a photo.
+              mask = cv2.inRange(
+                  hsv,
+                  np.array([0, 22, 55], np.uint8),
+                  np.array([30, 235, 255], np.uint8)
+              )
+              mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8))
+              mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7,7), np.uint8))
+              n, lab, st, cen = cv2.connectedComponentsWithStats(mask, 8)
+              out = []
+              for i in range(1, n):
+                  x0,y0,w0,h0,area = map(int, st[i])
+                  if w0 < min_size or h0 < min_size:
+                      continue
+                  if area < max(500, int(min_size * min_size * 0.55)):
+                      continue
+                  out.append((x0,y0,w0,h0,area))
+              return sorted(out, key=lambda z: z[4], reverse=True)
+
+          def _detect_faces(img, min_size=60):
+              """
+              Return face-like boxes using skin geometry only.
+              The old Haar-cascade implementation was removed because the runner reported:
+                  AttributeError: module 'cv2' has no attribute 'CascadeClassifier'
+              """
+              boxes = _skin_component_boxes(img, min_size)
+              return [(x0,y0,w0,h0) for x0,y0,w0,h0,_ in boxes]
+
+          def _choose_body_face(img):
+              H0,W0 = img.shape[:2]
+              boxes = _detect_faces(img, 50)
+
+              # Prefer candidates inside the configured head region and upper half.
+              hx0,hy0,hx1,hy1 = BODY_HEAD_BOX
+              candidates = []
+              cx_ref = (hx0 + hx1) / 2.0
+              cy_ref = (hy0 + hy1) / 2.0
+
+              for b in boxes:
+                  x0,y0,w0,h0 = b
+                  cx = x0 + w0/2.0
+                  cy = y0 + h0/2.0
+                  if cy > H0 * 0.48:
+                      continue
+                  inside = (x0 >= hx0-W0*0.08 and y0 >= hy0-H0*0.05 and
+                            x0+w0 <= hx1+W0*0.08 and y0+h0 <= hy1+H0*0.10)
+                  if not inside:
+                      continue
+                  area = w0*h0
+                  dist = math.hypot((cx-cx_ref)/max(W0,1), (cy-cy_ref)/max(H0,1))
+                  score = area / (1.0 + 5.0*dist)
+                  candidates.append((score,b))
+
+              if candidates:
+                  return max(candidates,key=lambda z:z[0])[1]
+
+              # Fallback: use the largest upper skin component.
+              upper = [b for b in boxes if b[1] < H0*0.50]
+              if upper:
+                  return max(upper,key=lambda b:b[2]*b[3])
+
+              # Last deterministic fallback is the user-editable head box.
+              x0,y0,x1,y1 = BODY_HEAD_BOX
+              return (x0,y0,max(1,x1-x0),max(1,y1-y0))
+
+          def _grid_face(img, rows, cols, r, c):
+              h0,w0 = img.shape[:2]
+              x0,x1 = c*w0//cols,(c+1)*w0//cols
+              y0,y1 = r*h0//rows,(r+1)*h0//rows
+
+              # Ignore the lower label area in the expression chart.
+              cell_h = max(1, int((y1-y0)*0.82))
+              cell = img[y0:y0+cell_h,x0:x1]
+
+              boxes = _detect_faces(cell, max(30, min(cell.shape[:2])//12))
+              if not boxes:
+                  return None
+
+              # Prefer the largest skin component whose center is in the upper/middle
+              # part of the chart cell; this avoids the skin-coloured shirt/neck fragments.
+              scored=[]
+              Hc,Wc=cell.shape[:2]
+              for b in boxes:
+                  bx,by,bw,bh=b
+                  cx=bx+bw/2.0; cy=by+bh/2.0
+                  if cy > Hc*0.72:
+                      continue
+                  score=(bw*bh)/(1.0+abs(cx-Wc/2.0)/(Wc+1e-6)*2.0)
+                  scored.append((score,b))
+              b=max(scored,key=lambda z:z[0])[1] if scored else boxes[0]
+              return (b[0]+x0,b[1]+y0,b[2],b[3])
+
+          def _box_from_face(face, x0, y0, x1, y1):
+              fx, fy, fw, fh = face
+              return (int(fx + fw*x0), int(fy + fh*y0), int(fx + fw*x1), int(fy + fh*y1))
+
+          def _fit_crop_to_box(src, alpha_src, target_w, target_h, fit=0.94):
+              h0, w0 = src.shape[:2]
+              scale = min(target_w/max(w0,1), target_h/max(h0,1)) * fit
+              nw, nh = max(1,int(w0*scale)), max(1,int(h0*scale))
+              r = cv2.resize(src, (nw,nh), interpolation=cv2.INTER_CUBIC)
+              a = cv2.resize(alpha_src, (nw,nh), interpolation=cv2.INTER_CUBIC)
+              canvas = np.zeros((target_h,target_w,3), np.float32)
+              ac = np.zeros((target_h,target_w), np.float32)
+              ox, oy = (target_w-nw)//2, (target_h-nh)//2
+              canvas[oy:oy+nh, ox:ox+nw] = r
+              ac[oy:oy+nh, ox:ox+nw] = a
+              return canvas, ac
+
+          def _nonwhite_foreground(img, thr=245):
+              gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+              bg = (gray > thr).astype(np.uint8)
+              n, lab, st, _ = cv2.connectedComponentsWithStats(bg, 8)
+              border_ids = set(np.unique(np.concatenate([lab[0], lab[-1], lab[:,0], lab[:,-1]])))
+              bgmask = np.isin(lab, list(border_ids))
+              return (~bgmask).astype(np.float32)
+
+          def _expression_normalized(img, face):
+              x0,y0,w0,h0 = face
+              pad = 0.08
+              xa=max(0,int(x0-pad*w0)); ya=max(0,int(y0-pad*h0))
+              xb=min(img.shape[1],int(x0+w0+pad*w0)); yb=min(img.shape[0],int(y0+h0+pad*h0))
+              crop=img[ya:yb,xa:xb]
+              return cv2.resize(crop,(320,320),interpolation=cv2.INTER_CUBIC)
+
+          def _expr_overlay_assets(expr_img, body_face):
+              labels = {(0,0):"neutral", (0,1):"half_closed", (0,2):"blink", (1,0):"happy", (1,1):"angry", (1,2):"surprised"}
+              faces = {}; normalized = {}
+              for r in range(EXPRESSION_ROWS):
+                  for c in range(EXPRESSION_COLS):
+                      b = _grid_face(expr_img, EXPRESSION_ROWS, EXPRESSION_COLS, r, c)
+                      if b is not None: faces[labels.get((r,c), f"expr_{r}_{c}")] = b; normalized[labels.get((r,c), f"expr_{r}_{c}")] = _expression_normalized(expr_img,b)
+              if "neutral" not in normalized:
+                  raise RuntimeError("Auto-calibration: expressions.jpg-এর neutral face detect করা যায়নি")
+              base_gray=cv2.cvtColor(normalized["neutral"],cv2.COLOR_BGR2GRAY)
+              fx,fy,fw,fh=body_face
+              target_eye=_box_from_face(body_face,float(os.environ.get("EYE_X0","0.08")),float(os.environ.get("EYE_Y0","0.22")),float(os.environ.get("EYE_X1","0.92")),float(os.environ.get("EYE_Y1","0.57")))
+              ex0,ey0,ex1,ey1=target_eye; ew,eh=ex1-ex0,ey1-ey0
+              assets={}
+              for name,norm in normalized.items():
+                  g=cv2.cvtColor(norm,cv2.COLOR_BGR2GRAY)
+                  # Transfer dark brows/iris/eyelid linework only; keep body skin and eye whites intact.
+                  a=(g<155).astype(np.float32)
+                  xa,xb=int(.10*320),int(.90*320); ya,yb=int(.20*320),int(.60*320)
+                  region=np.zeros_like(a); region[ya:yb,xa:xb]=1.0; a*=region
+                  a=cv2.morphologyEx(a.astype(np.uint8),cv2.MORPH_OPEN,np.ones((2,2),np.uint8)).astype(np.float32)
+                  a=cv2.GaussianBlur(a,(0,0),0.7)
+                  crop=norm
+                  fitted,fa=_fit_crop_to_box(crop,a,ew,eh,fit=1.0)
+                  assets[name]=(fitted,fa)
+              return faces, assets, target_eye
+
+          def _viseme_assets(vis_img, body_face):
+              names = ["A","E","I","O","U","M","F","L","REST"]
+              assets={}; cells={}
+              h0,w0=vis_img.shape[:2]
+              # Layout is measured from the image dimensions, not fixed 1920x1280 coordinates.
+              for idx,name in enumerate(names):
+                  r,c=divmod(idx,VISEME_COLS)
+                  x0,x1=c*w0//VISEME_COLS,(c+1)*w0//VISEME_COLS
+                  y0,y1=r*h0//VISEME_ROWS,(r+1)*h0//VISEME_ROWS
+                  cell=vis_img[y0:y1,x0:x1]
+                  ch,cw=cell.shape[:2]
+                  # The mouth occupies the central/lower face area. This relative region follows a changed resolution/layout.
+                  sx0,sx1=int(.20*cw),int(.80*cw); sy0,sy1=int(.32*ch),int(.78*ch)
+                  crop=cell[sy0:sy1,sx0:sx1]
+                  gray=cv2.cvtColor(crop,cv2.COLOR_BGR2GRAY)
+                  hsv=cv2.cvtColor(crop,cv2.COLOR_BGR2HSV)
+                  # Estimate the chart skin tone and keep mouth/teeth pixels that differ from it.
+                  skin_sel=(gray>150)&(gray<235)&(hsv[:,:,1]>35)
+                  skin=np.median(crop[skin_sel],axis=0) if np.any(skin_sel) else np.array([160,175,205],np.float32)
+                  dist=np.linalg.norm(crop.astype(np.float32)-skin.astype(np.float32),axis=2)
+                  a=(dist>22).astype(np.float32)
+                  # Elliptical mouth window prevents beard/side-face contamination.
+                  Y,X=np.ogrid[:crop.shape[0],:crop.shape[1]]
+                  ell=(((X-crop.shape[1]/2)/(crop.shape[1]*.43))**2 + ((Y-crop.shape[0]*.53)/(crop.shape[0]*.43))**2 <= 1).astype(np.float32)
+                  a*=ell
+                  # Preserve enclosed bright teeth by keeping pixels inside the dark mouth contour.
+                  dark=(gray<145).astype(np.uint8); n,lab,st,_=cv2.connectedComponentsWithStats(dark,8)
+                  if n>1:
+                      dm=np.zeros_like(dark)
+                      for ii in range(1,n):
+                          xx,yy,ww,hh,aa=st[ii]
+                          if aa>30 and .22 < (xx+ww/2)/max(crop.shape[1],1) < .78: dm[lab==ii]=1
+                      dm=cv2.dilate(dm,np.ones((3,3),np.uint8))
+                      # Fill local holes only; do not allow the entire skin ellipse to become opaque.
+                      a=np.maximum(a, (dm>0).astype(np.float32)*ell)
+                  a=cv2.GaussianBlur(a,(0,0),1.0)
+                  cells[name]=(x0,y0,x1,y1)
+                  assets[name]=(crop,a)
+              fx,fy,fw,fh=body_face
+              mouth_box=_box_from_face(body_face,float(os.environ.get("MOUTH_X0","0.20")),float(os.environ.get("MOUTH_Y0","0.60")),float(os.environ.get("MOUTH_X1","0.80")),float(os.environ.get("MOUTH_Y1","0.93")))
+              mx0,my0,mx1,my1=mouth_box; tw,th=mx1-mx0,my1-my0
+              fitted={}
+              for name,(crop,a) in assets.items():
+                  fitted[name]=_fit_crop_to_box(crop,a,tw,th,fit=0.96)
+              return cells,fitted,mouth_box
+
+          def _make_calibration_preview(body_img, body_face, eye_box, mouth_box, expr_assets, vis_assets, out_path):
+              # 1600x1000 montage: measured body + expression overlays + extracted visemes.
+              canvas=np.full((1000,1600,3),245,np.uint8)
+              body_rgb=cv2.resize(body_img,(650,850),interpolation=cv2.INTER_AREA)
+              bx,by,bw,bh=body_face; sx=650/body_img.shape[1]; sy=850/body_img.shape[0]
+              cv2.rectangle(body_rgb,(int(bx*sx),int(by*sy)),(int((bx+bw)*sx),int((by+bh)*sy)),(0,180,0),4)
+              cv2.rectangle(body_rgb,(int(eye_box[0]*sx),int(eye_box[1]*sy)),(int(eye_box[2]*sx),int(eye_box[3]*sy)),(255,120,0),4)
+              cv2.rectangle(body_rgb,(int(mouth_box[0]*sx),int(mouth_box[1]*sy)),(int(mouth_box[2]*sx),int(mouth_box[3]*sy)),(0,0,255),4)
+              canvas[80:930,40:690]=body_rgb
+              # Expression cards: apply each measured expression layer onto the actual body face.
+              names=["neutral","half_closed","blink","happy","angry","surprised"]
+              face_crop=body_img[by:by+bh,bx:bx+bw].copy().astype(np.float32)
+              ex0,ey0,ex1,ey1=eye_box; rx0,ry0=ex0-bx,ey0-by; rx1,ry1=ex1-bx,ey1-by
+              for i,name in enumerate(names):
+                  card=np.full((250,270,3),230,np.uint8)
+                  if name in expr_assets:
+                      im,a=expr_assets[name]
+                      face=face_crop.copy()
+                      patch=cv2.resize(im,(rx1-rx0,ry1-ry0),interpolation=cv2.INTER_CUBIC)
+                      pa=cv2.resize(a,(rx1-rx0,ry1-ry0),interpolation=cv2.INTER_CUBIC)
+                      face[ry0:ry1,rx0:rx1]=face[ry0:ry1,rx0:rx1]*(1-pa[...,None])+patch*pa[...,None]
+                      im=cv2.resize(np.clip(face,0,255).astype(np.uint8),(250,210),interpolation=cv2.INTER_AREA)
+                      card[10:220,10:260]=im
+                      cv2.putText(card,name,(10,242),cv2.FONT_HERSHEY_SIMPLEX,.65,(20,20,20),2,cv2.LINE_AA)
+                  xx=720+(i%3)*290; yy=40+(i//3)*280; canvas[yy:yy+250,xx:xx+270]=card
+              # Viseme cards show the exact auto-extracted source patch used for fitting.
+              names2=["A","E","I","O","U","M","F","L","REST"]
+              for i,name in enumerate(names2):
+                  card=np.full((150,270,3),230,np.uint8)
+                  if name in vis_assets:
+                      im,a=vis_assets[name]; im=np.clip(im,0,255).astype(np.uint8); im=cv2.resize(im,(250,110),interpolation=cv2.INTER_AREA); card[10:120,10:260]=im
+                      cv2.putText(card,name,(10,143),cv2.FONT_HERSHEY_SIMPLEX,.55,(20,20,20),2,cv2.LINE_AA)
+                  xx=720+(i%3)*290; yy=550+(i//3)*150; canvas[yy:yy+150,xx:xx+270]=card
+              cv2.putText(canvas,"AUTO-CALIBRATION PREVIEW: green=head, orange=eyes, red=mouth",(40,35),cv2.FONT_HERSHEY_SIMPLEX,.75,(20,20,20),2,cv2.LINE_AA)
+              cv2.imwrite(out_path,canvas)
+
+          # Resolve measured geometry.
+          calibration_errors=[]; calibration_warnings=[]
+          detected_body_face=_choose_body_face(body)
+          if CALIBRATION_MODE in ("auto","strict") and detected_body_face is None:
+              calibration_errors.append("body.jpg-এর মুখ detect করা যায়নি")
+          body_face = detected_body_face
+          if body_face is None:
+              # Manual/off fallback only; AUTO/STRICT fail below.
+              bx0,by0,bx1,by1=BODY_HEAD_BOX; body_face=(bx0,by0,bx1-bx0,by1-by0)
+          try:
+              expr_faces, EXPR_ASSETS, BODY_EYE_BOX_AUTO = _expr_overlay_assets(expr, body_face)
+              _, VIS_ASSETS, BODY_MOUTH_BOX_AUTO = _viseme_assets(vis, body_face)
+              if len(EXPR_ASSETS) < min(6, EXPRESSION_ROWS*EXPRESSION_COLS): calibration_errors.append(f"expressions.jpg: expected {EXPRESSION_ROWS*EXPRESSION_COLS} faces, found {len(EXPR_ASSETS)}")
+              if len(VIS_ASSETS) < min(9, VISEME_ROWS*VISEME_COLS): calibration_errors.append(f"visemes.jpg: expected {VISEME_ROWS*VISEME_COLS} visemes, built {len(VIS_ASSETS)}")
+              # A changed chart may still be scaled, but a materially different head aspect ratio
+              # indicates that the three source images are not the same character/layout family.
+              bf_ratio = body_face[2] / max(body_face[3], 1)
+              for _ename, _eb in expr_faces.items():
+                  er = _eb[2] / max(_eb[3], 1)
+                  if abs(er - bf_ratio) / max(bf_ratio, 1e-6) > CALIBRATION_TOLERANCE:
+                      calibration_warnings.append(f"{_ename} head aspect ratio differs from body by > {CALIBRATION_TOLERANCE:.0%}")
+          except Exception as e:
+              calibration_errors.append("auto-calibration exception: " + repr(e))
+              EXPR_ASSETS={}; VIS_ASSETS={}; BODY_EYE_BOX_AUTO=tuple(map(int,BODY_EYE_BOX)); BODY_MOUTH_BOX_AUTO=tuple(map(int,BODY_MOUTH_BOX))
+
+          # Use measured targets in AUTO/STRICT; manual/off preserves configured boxes.
+          if CALIBRATION_MODE in ("auto","strict"):
+              BODY_EYE_BOX = BODY_EYE_BOX_AUTO
+              BODY_MOUTH_BOX = BODY_MOUTH_BOX_AUTO
+          else:
+              BODY_EYE_BOX = tuple(map(int,BODY_EYE_BOX)); BODY_MOUTH_BOX = tuple(map(int,BODY_MOUTH_BOX))
+
+          # Crop-local boxes are derived from measured targets; render uses y0,y1,x0,x1 to match NumPy slicing.
+          def _clip_box_to_crop_xyxy(box):
+              # Calibration boxes stay in image order: x0,y0,x1,y1.
+              return (max(0,int(box[0]-CX0)), max(0,int(box[1]-CY0)),
+                      min(CW,int(box[2]-CX0)), min(CH,int(box[3]-CY0)))
+
+          def _xyxy_to_yxyx(box):
+              # Numpy ROI order: y0,y1,x0,x1.
+              x0,y0,x1,y1 = box
+              return (y0,y1,x0,x1)
+
+          EB_XYXY = _clip_box_to_crop_xyxy(BODY_EYE_BOX)
+          MB_XYXY = _clip_box_to_crop_xyxy(BODY_MOUTH_BOX)
+          if EB_XYXY[2] <= EB_XYXY[0] or EB_XYXY[3] <= EB_XYXY[1]: calibration_errors.append("eye target box is outside body crop")
+          if MB_XYXY[2] <= MB_XYXY[0] or MB_XYXY[3] <= MB_XYXY[1]: calibration_errors.append("mouth target box is outside body crop")
+          EB = _xyxy_to_yxyx(EB_XYXY)
+          MB = _xyxy_to_yxyx(MB_XYXY)
+
+          # Convert auto assets to render-ready dictionaries and enforce exact ROI shape.
+          def _fit_exact(im_, a_, target_w, target_h):
+              target_w=max(1,int(target_w)); target_h=max(1,int(target_h))
+              im2=cv2.resize(im_,(target_w,target_h),interpolation=cv2.INTER_CUBIC).astype(np.float32)
+              a2=cv2.resize(a_,(target_w,target_h),interpolation=cv2.INTER_CUBIC).astype(np.float32)
+              if a2.ndim==2: a2=a2[...,None]
+              return im2, np.clip(a2,0,1)
+
+          mouth_h=MB[1]-MB[0]; mouth_w=MB[3]-MB[2]
+          eye_h=EB[1]-EB[0]; eye_w=EB[3]-EB[2]
+          MOUTH={}; MMV={}
+          for k_,(im_,a_) in VIS_ASSETS.items():
+              MOUTH[k_], a2 = _fit_exact(im_,a_,mouth_w,mouth_h)
+              MMV[k_] = a2
+          EYES={}; EM={}
+          for k_,(im_,a_) in EXPR_ASSETS.items():
+              EYES[k_], a2 = _fit_exact(im_,a_,eye_w,eye_h)
+              EM[k_] = a2
+          # If neutral expression is unavailable, keep a transparent neutral layer.
+          if "neutral" not in EYES:
+              EYES["neutral"]=np.zeros((eye_h,eye_w,3),np.float32); EM["neutral"]=np.zeros((eye_h,eye_w,1),np.float32)
+          if "half_closed" in EYES: EYES["closed"],EM["closed"]=EYES["half_closed"],EM["half_closed"]
+          elif "blink" in EYES: EYES["closed"],EM["closed"]=EYES["blink"],EM["blink"]
+          else: EYES["closed"],EM["closed"]=EYES["neutral"],EM["neutral"]
+
+          print("Calibration ROI shapes:", {"EB": EB, "eye_asset": {k_: tuple(v.shape) for k_,v in EYES.items()}, "MB": MB, "mouth_asset": {k_: tuple(v.shape) for k_,v in MOUTH.items()}})
+
+          # Calibration preview and machine-readable report.
+          report=[
+              "Animated Bangla Podcast — AUTO CALIBRATION REPORT",
+              f"mode={CALIBRATION_MODE}",
+              f"body={body.shape[1]}x{body.shape[0]}", f"expressions={expr.shape[1]}x{expr.shape[0]}", f"visemes={vis.shape[1]}x{vis.shape[0]}",
+              f"body_face={body_face}", f"eye_target={BODY_EYE_BOX}", f"mouth_target={BODY_MOUTH_BOX}",
+              f"expression_assets={sorted(EXPR_ASSETS.keys())}", f"viseme_assets={sorted(VIS_ASSETS.keys())}",
+              f"errors={calibration_errors}", f"warnings={calibration_warnings}",
+              "The final render uses these measured targets; old hard-coded MV/ME matrices are not used in AUTO/STRICT mode."
+          ]
+          with open("calibration_report.txt","w",encoding="utf-8") as rf: rf.write("\n".join(report)+"\n")
+          with open("calibration.json","w",encoding="utf-8") as jf:
+              json.dump({"mode":CALIBRATION_MODE,"body_face":body_face,"eye_target":BODY_EYE_BOX,"mouth_target":BODY_MOUTH_BOX,"expression_assets":sorted(EXPR_ASSETS.keys()),"viseme_assets":sorted(VIS_ASSETS.keys()),"errors":calibration_errors,"warnings":calibration_warnings},jf,ensure_ascii=False,indent=2)
+          if CALIBRATION_PREVIEW:
+              _make_calibration_preview(body,body_face,BODY_EYE_BOX,BODY_MOUTH_BOX,EXPR_ASSETS,VIS_ASSETS,"calibration_preview.png")
+          if calibration_errors and FAIL_ON_CALIBRATION_ERROR and CALIBRATION_MODE in ("auto","strict"):
+              raise RuntimeError("Calibration failed; video render stopped. See calibration_report.txt")
+          if PREVIEW_ONLY:
+              print("Preview-only mode: calibration files created; skipping podcast render.")
+              raise SystemExit(0)
+
+          # The render uses crop-local measured target boxes directly.
+          mouth_mask=np.ones((MB[3]-MB[1],MB[2]-MB[0],1),np.float32)
+          basef=base.astype(np.float32); P4=np.dstack([basef,alpha])
+          YY, XX = np.mgrid[0:CH, 0:CW].astype(np.float32); wgt = np.clip((CH - 20 - YY) / 480., 0, 1); wgt = wgt * wgt * (3 - 2 * wgt)
+          PX, PY = CW / 2, CH - 20
+          def bend(img, tilt, dy):
+              a = np.deg2rad(-tilt) * wgt; dx_, dy_ = XX - PX, (YY - dy * wgt) - PY
+              return cv2.remap(img, (PX + dx_ * np.cos(a) - dy_ * np.sin(a)).astype(np.float32), (PY + dx_ * np.sin(a) + dy_ * np.cos(a)).astype(np.float32),
+                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+          SC = 0.66; PW, PH = int(CW * SC), int(CH * SC); PX0, PY0 = 640 - PW // 2, 22
+
+          # ============================== ৪) ফন্ট ও বাংলা টেক্সট ==============================
+          _CMAPS = {}
+          def _cmap(p):
+              if p not in _CMAPS:
+                  try: _CMAPS[p] = set(TTFont(p, lazy=True).getBestCmap().keys())
+                  except Exception: _CMAPS[p] = None
+              return _CMAPS[p]
+          def _bn_path(bold):
+              c = sorted(glob.glob("/usr/share/fonts/**/*Bengali*.ttf", recursive=True)); c = [p for p in c if "UI" not in os.path.basename(p)] or c
+              want = "-Bold.ttf" if bold else "-Regular.ttf"; ex_ = [p for p in c if p.endswith(want)]
+              return (ex_ or c or [None])[0]
+          def _fallback_paths(bold):
+              # বাংলা ফন্টে যে অক্ষর (যেমন ❝ ❞ ও ইংরেজি S2) নেই, সেগুলো এই ফন্টগুলো থেকে আসবে
+              n = "Bold" if bold else "Regular"
+              return [p for p in [f"/usr/share/fonts/truetype/noto/NotoSans-{n}.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                                  "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"] if os.path.exists(p)]
+          class FS:      # একাধিক ফন্টের সেট: প্রতিটি অক্ষর প্রথম যে ফন্টে গ্লিফ আছে সেটা দিয়ে আঁকা হয় (বক্স/টোফু আসে না)
+              def __init__(self, size, bold=False):
+                  self.fonts, self.cmaps = [], []
+                  for p in [_bn_path(bold)] + _fallback_paths(bold):
+                      if not p: continue
+                      try: f = ImageFont.truetype(p, size, layout_engine=ImageFont.Layout.RAQM)
+                      except Exception: continue
+                      self.fonts.append(f); self.cmaps.append(_cmap(p))
+                  if not self.fonts: self.fonts, self.cmaps = [ImageFont.load_default()], [None]
+              def pick(self, ch):
+                  o = ord(ch)
+                  if 0x0980 <= o <= 0x09FF: return 0                      # বাংলা ব্লক সবসময় বাংলা ফন্টে
+                  for i, cm in enumerate(self.cmaps):
+                      if cm is None or o in cm: return i
+                  return 0
+              def runs(self, text):
+                  out = []
+                  for ch in text:
+                      if out and (ch.isspace() or ord(ch) in (0x200C, 0x200D) or unicodedata.combining(ch)): i = out[-1][0]   # স্পেস/যুক্ত চিহ্ন আগের অংশের সাথে
+                      else: i = self.pick(ch)
+                      if out and out[-1][0] == i: out[-1][1] += ch
+                      else: out.append([i, ch])
+                  return out
+          def bfont(size, bold=False): return FS(size, bold)
+          def tlen(text, fs): return sum(fs.fonts[i].getlength(seg) for i, seg in fs.runs(text))
+          def draw_rt(dr, x, y, text, fs, fill, anchor="lm"):      # anchor: প্রথম অক্ষর l/m (বাঁ/মাঝ), দ্বিতীয় m/a (উলম্ব মাঝ/উপর)
+              w = tlen(text, fs); asc, desc = fs.fonts[0].getmetrics()
+              cx = x - w / 2 if anchor[0] == "m" else x
+              base = y - (asc + desc) / 2 + asc if anchor[1] == "m" else y + asc
+              for i, seg in fs.runs(text):
+                  dr.text((cx, base), seg, font=fs.fonts[i], fill=fill, anchor="ls"); cx += fs.fonts[i].getlength(seg)
+          def efont(size):
+              try: return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+              except Exception: return ImageFont.load_default()
+
+          # ============================== ৫) স্টুডিও ব্যাকগ্রাউন্ড (স্ট্যাটিক) ==============================
+          S = 2; rng = random.Random(5)
+          def grad(h, w, c0, c1):
+              t = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]; return (np.array(c0, np.float32) * (1 - t) + np.array(c1, np.float32) * t) * np.ones((1, w, 1), np.float32)
+          bg = grad(H, W, (58, 38, 30), (34, 22, 20))                    # BGR: গাঢ় নীলচে দেয়াল
+          bgI = Image.fromarray(cv2.cvtColor(np.clip(bg, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)).resize((W * S, H * S)); d = ImageDraw.Draw(bgI, "RGBA")
+          q = lambda *a: [v * S for v in a]
+          # স্ল্যাট ওয়াল (মাঝে)
+          d.rectangle(q(300, 0, 980, 590), fill=(52, 36, 32, 255))
+          for x in range(300, 980, 26):
+              d.rectangle(q(x, 0, x + 20, 590), fill=(96, 66, 46, 255)); d.rectangle(q(x + 14, 0, x + 20, 590), fill=(70, 48, 36, 255))
+          # LED স্ট্রিপ
+          d.rectangle(q(300, 0, 980, 8), fill=(255, 200, 130, 255)); d.rectangle(q(300, 590, 980, 594), fill=(255, 160, 90, 200))
+          # বইয়ের তাক (বামে)
+          d.rounded_rectangle(q(30, 100, 285, 600), 8 * S, fill=(40, 28, 24, 255), outline=(20, 14, 12, 255), width=3)
+          pal = [(200, 70, 70), (70, 130, 200), (230, 190, 80), (90, 170, 120), (170, 100, 190), (230, 130, 70), (240, 240, 235)]
+          for r in range(4):
+              y1 = 100 + 30 + r * 118 + 88; x = 42
+              while x < 268:
+                  bw = rng.randint(14, 26); bh = rng.randint(58, 86)
+                  if x + bw > 272: break
+                  d.rectangle(q(x, y1 - bh, x + bw, y1), fill=rng.choice(pal) + (255,)); d.rectangle(q(x + 3, y1 - bh + 8, x + bw - 3, y1 - bh + 11), fill=(255, 255, 255, 120)); x += bw + 2
+              d.rectangle(q(34, y1, 281, y1 + 9), fill=(120, 80, 52, 255))
+          # ছোট গাছ (তাকের উপর)
+          d.rounded_rectangle(q(60, 70, 100, 100), 5 * S, fill=(220, 220, 215, 255))
+          for ang, ln in [(-50, 34), (-20, 44), (10, 46), (40, 36), (-80, 26)]:
+              ex_, ey_ = 80 + ln * math.sin(math.radians(ang)), 72 - ln * math.cos(math.radians(ang)); d.line(q(80, 72, ex_, ey_), fill=(60, 160, 90, 255), width=5 * S)
+              d.ellipse(q(ex_ - 9, ey_ - 7, ex_ + 9, ey_ + 7), fill=(80, 190, 110, 255))
+          # ফ্রেম (ডানে উপরে ছাড়া) - ছোট আর্ট
+          d.rounded_rectangle(q(1010, 30, 1100, 90), 6 * S, fill=(30, 24, 26, 255), outline=(200, 170, 120, 255), width=3 * S)
+          d.polygon(q(1020, 82, 1042, 48, 1060, 70, 1075, 52, 1092, 82), fill=(90, 150, 200, 255)); d.ellipse(q(1070, 38, 1084, 52), fill=(250, 220, 120, 255))
+          # EQ স্ক্রিন প্যানেল (ডানে)
+          d.rounded_rectangle(q(955, 250, 1245, 450), 14 * S, fill=(14, 12, 24, 255), outline=(90, 80, 130, 255), width=3 * S)
+          d.text(q(972, 258), "LIVE AUDIO", font=efont(13 * S), fill=(150, 140, 200, 255))
+          # ঘড়ি নয়, ডানদিকের ফ্লোর ল্যাম্প
+          d.rectangle(q(1200, 470, 1206, 600), fill=(30, 30, 34, 255)); d.polygon(q(1170, 470, 1236, 470, 1224, 430, 1182, 430), fill=(250, 200, 120, 255))
+          bgS = cv2.cvtColor(np.array(bgI.resize((W, H), Image.LANCZOS)), cv2.COLOR_RGB2BGR).astype(np.float32)
+          # হেড-হ্যালো (চরিত্রের পেছনে উষ্ণ আলো) ও ভিগনেট
+          yy, xx = np.mgrid[0:H, 0:W].astype(np.float32); hr = np.sqrt(((xx - 640) / 300) ** 2 + ((yy - 250) / 260) ** 2)
+          halo = np.clip(1 - hr, 0, 1) ** 1.6 * .55; bgS = bgS * (1 - halo[..., None]) + np.array([150, 200, 255], np.float32) * halo[..., None]
+          vg = 1 - .38 * np.clip(np.sqrt(((xx - 640) / 760) ** 2 + ((yy - 360) / 470) ** 2) - .35, 0, 1) ** 1.2; bgS *= vg[..., None]
+
+          # ডেস্ক + মাইক + কফি মগ (ক্যারেক্টারের সামনে)
+          fgI = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0)); g = ImageDraw.Draw(fgI, "RGBA")
+          g.rectangle(q(0, 585, 1280, 650), fill=(150, 100, 64, 255))
+          for y in range(585, 650, 4): g.line(q(0, y, 1280, y), fill=(138, 93, 60, 255), width=S)
+          g.rectangle(q(0, 585, 1280, 590), fill=(210, 160, 110, 255)); g.rectangle(q(0, 650, 1280, 720), fill=(88, 58, 40, 255)); g.rectangle(q(0, 650, 1280, 655), fill=(60, 38, 28, 255))
+          # মাইক: বেস, বাহু, ক্যাপসুল
+          g.ellipse(q(455, 592, 535, 616), fill=(30, 30, 36, 255)); g.line(q(490, 604, 526, 560), fill=(46, 46, 54, 255), width=9 * S)
+          mic = Image.new("RGBA", (120 * S, 200 * S), (0, 0, 0, 0)); md = ImageDraw.Draw(mic)
+          md.rounded_rectangle((25 * S, 20 * S, 95 * S, 160 * S), 34 * S, fill=(38, 40, 48, 255), outline=(100, 104, 120, 255), width=3 * S)
+          for yy_ in range(36, 150, 8): md.line((30 * S, yy_ * S, 90 * S, yy_ * S), fill=(88, 92, 108, 255), width=2 * S)
+          md.rectangle((28 * S, 96 * S, 92 * S, 104 * S), fill=(200, 60, 60, 255))
+          mic = mic.rotate(-24, resample=Image.BICUBIC, expand=True); fgI.alpha_composite(mic, ((540 - mic.width // 2 // S) * S, (494 - mic.height // 2 // S) * S))
+          # মগ
+          g.rounded_rectangle(q(840, 545, 905, 600), 8 * S, fill=(240, 240, 236, 255)); g.arc(q(892, 555, 926, 590), -90, 90, fill=(240, 240, 236, 255), width=6 * S)
+          g.ellipse(q(844, 545, 902, 556), fill=(90, 56, 34, 255)); g.rectangle(q(850, 572, 896, 578), fill=(230, 90, 90, 255))
+          # নোটবুক ও কলম
+          g.polygon(q(960, 610, 1080, 606, 1092, 640, 966, 646), fill=(240, 236, 220, 255), outline=(180, 170, 150, 255)); g.line(q(985, 625, 1060, 622), fill=(140, 140, 160, 255), width=2 * S); g.line(q(985, 633, 1050, 631), fill=(140, 140, 160, 255), width=2 * S)
+          fgA = np.array(fgI.resize((W, H), Image.LANCZOS)).astype(np.float32); FG = cv2.cvtColor(fgA[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32); FGa = fgA[..., 3:4] / 255
+
+          # নিয়ন সাইন ও ON AIR
+          def glow_layer(size, draw_fn, blur):
+              im = Image.new("RGBA", size, (0, 0, 0, 0)); draw_fn(ImageDraw.Draw(im)); a = np.array(im).astype(np.float32)
+              rgb = cv2.cvtColor(a[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32); al = a[..., 3:4] / 255
+              gl = cv2.GaussianBlur(rgb * al, (0, 0), blur); return rgb, al, gl
+          NX0, NY0, NW, NH = 930, 70, 330, 150
+          def neon_draw(dr):
+              f = bfont(46, True); tw = tlen(PODCAST_NAME, f)
+              if tw > NW - 40: f = bfont(int(46 * (NW - 40) / tw), True); tw = tlen(PODCAST_NAME, f)
+              dr.rounded_rectangle((8, 12, NW - 8, NH - 12), 22, outline=(255, 90, 200, 255), width=4)
+              draw_rt(dr, (NW - tw) / 2, 34, PODCAST_NAME, f, (255, 210, 245, 255), "la")
+              dr.line((60, NH - 34, NW - 60, NH - 34), fill=(80, 220, 255, 255), width=4)
+          N_RGB, N_A, N_GL = glow_layer((NW, NH), neon_draw, 9)
+          OX0, OY0, OW, OH = 1010, 470, 170, 56
+          def air_draw(dr):
+              dr.rounded_rectangle((4, 4, OW - 4, OH - 4), 14, fill=(200, 30, 40, 255), outline=(255, 120, 120, 255), width=3); dr.text((OW / 2, OH / 2), "ON AIR", font=efont(26), fill=(255, 235, 235, 255), anchor="mm")
+          A_RGB, A_A, A_GL = glow_layer((OW, OH), air_draw, 8)
+          # ফ্লিকার
+          fl = np.ones(NF, np.float32); rr = random.Random(3); i = 0
+          while i < NF:
+              i += rr.randint(40, 110)
+              for j in range(rr.randint(2, 4)):
+                  if i + j < NF: fl[i + j] = .45 if j % 2 == 0 else .9
+          # ধুলিকণা
+          dust = [(rng.uniform(300, 980), rng.uniform(40, 560), rng.uniform(.2, .7), rng.uniform(0, 6.28)) for _ in range(40)]
+
+          # ============================== ৬) সাবটাইটেল ও শিরোনাম ==============================
+          def wrap(dr, text, f, maxw):
+              out, cur = [], ""
+              for wd in text.split():
+                  t_ = (cur + " " + wd).strip()
+                  if tlen(t_, f) > maxw and cur: out.append(cur); cur = wd
+                  else: cur = t_
+              return out + [cur]
+          CAPF = bfont(29); tmpd = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+          def cap_img(text):
+              lines = wrap(tmpd, text, CAPF, 980); lh = 46; w_ = int(max(tlen(l, CAPF) for l in lines)) + 56; h_ = lh * len(lines) + 18
+              im = Image.new("RGBA", (w_, h_), (0, 0, 0, 0)); dr = ImageDraw.Draw(im); dr.rounded_rectangle((0, 0, w_ - 1, h_ - 1), 18, fill=(12, 12, 26, 205))
+              for i_, l in enumerate(lines): draw_rt(dr, w_ / 2, 9 + lh * i_ + lh / 2 - 2, l, CAPF, (255, 255, 255, 255), "mm")
+              a = np.array(im).astype(np.float32); return cv2.cvtColor(a[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32), a[..., 3:4] / 255
+          CAPS = [cap_img(s["text"]) for s in segs]
+          tf = bfont(24, True); tw_ = int(tlen(EPISODE, tf)) + 44
+          ti = Image.new("RGBA", (tw_, 46), (0, 0, 0, 0)); td = ImageDraw.Draw(ti); td.rounded_rectangle((0, 0, tw_ - 1, 45), 22, fill=(220, 50, 90, 235)); td.ellipse((14, 17, 26, 29), fill=(255, 255, 255, 255)); draw_rt(td, 36, 23, EPISODE, tf, (255, 255, 255, 255), "lm")
+          ta = np.array(ti).astype(np.float32); T_RGB = cv2.cvtColor(ta[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32); T_A = ta[..., 3:4] / 255
+          def put(canvas, rgb, a, x0, y0, k=1.0):
+              h_, w_ = a.shape[:2]; x0 = int(x0); y0 = int(y0); r = canvas[y0:y0 + h_, x0:x0 + w_]; aa = a * k; r[:] = r * (1 - aa) + rgb * aa
+
+          # ============================== ৭) টাইমলাইন ==============================
+          def seg_at(tt):
+              for i_, s in enumerate(segs):
+                  if s["s"] <= tt <= s["e"] + .25: return i_
+              return -1
+          EXN = ["neutral", "happy", "angry", "surprised"]; wexp = {k_: 0.0 for k_ in EXN}; wexp["neutral"] = 1.0
+          rnd = random.Random(11); blinks = sorted({int(rnd.uniform(1.0, dur + .3) * FPS) for _ in range(max(3, int(dur / 3.2)))}); PROF = [.35, .85, 1, .85, .35]
+          def blink_lvl(f):
+              for b in blinks:
+                  if 0 <= f - b < len(PROF): return PROF[f - b]
+              return 0.
+
+          # ============================== ৮) রেন্ডার ==============================
+          cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-i", AUDIO]
+          if os.path.exists(BGM): cmd += ["-stream_loop", "-1", "-i", BGM, "-filter_complex", "[2:a]volume=0.10[b];[1:a][b]amix=inputs=2:duration=first:normalize=0,apad[a]", "-map", "0:v", "-map", "[a]"]
+          else: cmd += ["-map", "0:v", "-map", "1:a", "-af", "apad"]
+          ff = subprocess.Popen(cmd + ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-t", "%.3f" % (NF / FPS), OUT], stdin=subprocess.PIPE)
+          prev_seg = -1
+          mw = {k_: 0. for k_ in MMV}; mw["REST"] = 1.        # viseme-র ওজন (দ্রুত বদলালে মুখ ঝাঁকি খায় না)
+          gesture_state = {"right": 0.0, "left": 0.0}
+          for f in range(NF):
+              tt = f / FPS; si = seg_at(tt)
+              if si != prev_seg and si >= 0: seg_start = tt
+              prev_seg = si
+              tgt = segs[si]["ex"] if si >= 0 and segs[si]["ex"] in EXN else "neutral"
+              for k_ in EXN: wexp[k_] += ((1.0 if k_ == tgt else 0.0) - wexp[k_]) * .28
+              fr = basef.copy(); alpha_work = alpha.copy(); r0, r1, c0, c1 = EB
+              roi = fr[r0:r1, c0:c1]
+              for k_ in ["neutral", "happy", "angry", "surprised"]:
+                  w_ = wexp[k_]
+                  if w_ > .01:
+                      m_ = EM[k_] * w_
+                      if roi.shape != EYES[k_].shape:
+                          raise RuntimeError(f"Expression ROI mismatch for {k_}: roi={roi.shape}, asset={EYES[k_].shape}, EB={EB}")
+                      roi[:] = roi * (1 - m_) + EYES[k_] * m_
+              b_ = blink_lvl(f)
+              if b_ > 0:
+                  if roi.shape != EYES["closed"].shape:
+                      raise RuntimeError(f"Blink ROI mismatch: roi={roi.shape}, asset={EYES['closed'].shape}, EB={EB}")
+                  m_ = EM["closed"] * b_; roi[:] = roi * (1 - m_) + EYES["closed"] * m_
+              m0, m1, n0, n1 = MB
+              for k_ in mw: mw[k_] += ((1. if k_ == VIS_AT[f] else 0.) - mw[k_]) * .75
+              ws_ = sum(w_ for w_ in mw.values() if w_ > .02); A_ = 0.; C_ = 0.
+              for k_, w_ in mw.items():
+                  if w_ > .02: A_ = A_ + (w_ / ws_) * MMV[k_]; C_ = C_ + (w_ / ws_) * MMV[k_] * MOUTH[k_]
+              A_ = np.clip(A_, 0.0, 1.0)
+              mouth_roi = fr[m0:m1, n0:n1]
+              if mouth_roi.shape != C_.shape:
+                  raise RuntimeError(f"Viseme ROI mismatch: roi={mouth_roi.shape}, asset={C_.shape}, MB={MB}")
+              fr[m0:m1, n0:n1] = mouth_roi * (1 - A_) + C_
+              # Timestamp-driven hand/arm movement: raise, salute, salam, wave.
+              phase = 0.0 if si < 0 else max(0.0, min(1.0, (tt - segs[si]["s"]) / max(.001, segs[si]["e"] - segs[si]["s"])))
+              action = segs[si]["gesture"] if si >= 0 else "none"
+              strength = segs[si]["intensity"] if si >= 0 else 0.0
+              fr, alpha_work = apply_gesture_rig(fr, alpha_work, action, strength, phase, gesture_state)
+
+              # শরীরের ভাষা: শ্বাস, বলার সময় মাথা দোলা, প্রতি অংশের শুরুতে নড
+              nod = 0.
+              if si >= 0 and tt - seg_start < .45: nod = math.sin(math.pi * (tt - seg_start) / .45)
+              dy = 3.5 * math.sin(tt * 1.9) + 9 * env[f] * math.sin(tt * 6.3 + 1) * .4 + 12 * nod
+              tilt = 1.0 * math.sin(tt * 1.15) + 1.2 * env[f] * math.sin(tt * 3.1)
+              p = cv2.resize(bend(np.dstack([fr, alpha_work]), tilt, dy), (PW, PH), interpolation=cv2.INTER_AREA)
+              cv = bgS.copy()
+              # ধুলিকণা
+              for (dx0, dy0, sz, ph) in dust:
+                  px = dx0 + 12 * math.sin(tt * .4 + ph); py = (dy0 - tt * 6 * sz) % 560 + 20; cv2.circle(cv, (int(px), int(py)), 1, (200, 230, 255), -1, cv2.LINE_AA) if sz > .45 else cv2.circle(cv, (int(px), int(py)), 1, (120, 150, 170), -1)
+              # ক্যারেক্টার
+              put(cv, p[..., :3], p[..., 3:4], PX0, PY0)
+              # নিয়ন ও ON AIR (ঝিকমিক)
+              k_n = fl[f]; put(cv, N_RGB, N_A, NX0, NY0, 1); reg = cv[NY0:NY0 + NH, NX0:NX0 + NW]; reg += N_GL * (.9 * k_n)
+              pulse = .65 + .35 * math.sin(tt * 2.4) ** 2 + .25 * env[f]; put(cv, A_RGB, A_A, OX0, OY0, 1); reg2 = cv[OY0:OY0 + OH, OX0:OX0 + OW]; reg2 += A_GL * pulse
+              # ইকুয়ালাইজার
+              ex0, ey0, ew, eh = 972, 282, 256, 156; roi_e = cv[ey0:ey0 + eh, ex0:ex0 + ew]; layer = np.zeros_like(roi_e); bw = ew / NB
+              for j in range(NB):
+                  hh = int(6 + spec[f, j] * (eh - 12)); x_a = int(j * bw + 1); col = (int(255 - 200 * j / NB), int(120 + 110 * spec[f, j]), int(90 + 160 * j / NB))
+                  cv2.rectangle(layer, (x_a, eh - hh), (int(x_a + bw - 3), eh), col, -1)
+              roi_e += layer * .95 + cv2.GaussianBlur(layer, (0, 0), 5) * .7
+              # ডেস্ক/মাইক/মগ
+              put(cv, FG, FGa, 0, 0)
+              # মগের ধোঁয়া
+              ov = np.zeros((90, 60, 3), np.float32)
+              for kk in range(3):
+                  pts = np.array([[int(30 + (kk - 1) * 12 + 7 * math.sin(tt * 2 + yv / 11 + kk * 2)), 88 - yv] for yv in range(0, 86, 4)], np.int32)
+                  cv2.polylines(ov, [pts.reshape(-1, 1, 2)], False, (235, 235, 240), 3, cv2.LINE_AA)
+              ov = cv2.GaussianBlur(ov, (0, 0), 2.2); sy, sx = 455, 848; reg3 = cv[sy:sy + 90, sx:sx + 60]; reg3 += ov * .55
+              # Camera motion: global slow zoom + optional per-timestamp override.
+              cam_mode = segs[si]["camera"] if si >= 0 else "default"
+              if cam_mode == "static":
+                  z = 1.0
+              elif cam_mode == "push_in":
+                  z = 1.0 + .055 * (phase if si >= 0 else 0.0)
+              elif cam_mode == "pull_out":
+                  z = 1.055 - .055 * (phase if si >= 0 else 0.0)
+              else:
+                  z = 1.0 + .035 * (tt / max(dur, 1))
+              Mz = np.array([[z, 0, (1 - z) * 640], [0, z, (1 - z) * 330]], np.float32)
+              out = cv2.warpAffine(np.clip(cv, 0, 255).astype(np.uint8), Mz, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+              put(out, T_RGB, T_A, 34, 26)
+              if si >= 0:
+                  rgb, a = CAPS[si]; k_c = min(1., (tt - segs[si]["s"] + .15) / .15, (segs[si]["e"] + .25 - tt) / .15 + .0) if True else 1.
+                  put(out, rgb, a, (W - a.shape[1]) // 2, 712 - a.shape[0], max(0., min(1., k_c)))
+              ff.stdin.write(np.clip(out, 0, 255).astype(np.uint8).tobytes())
+          ff.stdin.close(); ff.wait(); print("তৈরি হয়েছে:", OUT)
+          PYEOF
+          python podcast.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: podcast-video
+          path: |
+            podcast.mp4
+            timestamps.txt
+            gesture_timeline.txt
+            calibration_report.txt
+            calibration.json
+            calibration_preview.png
