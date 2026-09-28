@@ -9,9 +9,6 @@ name: Animated Bangla Podcast
 #   bgm.mp3          -> (ঐচ্ছিক) ব্যাকগ্রাউন্ড মিউজিক, ১০% ভলিউমে মিশবে
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-
 env:
   PODCAST_NAME: "আমার পডকাস্ট"          # নিয়ন সাইনে যা দেখাবে
   EPISODE: "পর্ব ০১ | স্বাগতম"           # উপরের বাঁ কোণের ট্যাগ
