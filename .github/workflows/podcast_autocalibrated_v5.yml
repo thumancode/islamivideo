@@ -672,17 +672,44 @@ jobs:
               zone = np.zeros((h, w), np.uint8)
               cv2.rectangle(zone, (int(ax - .62*rw), int(ay - .20*rw)), (int(ax + .62*rw), int(ay + .28*rw)), 1, -1)
               dark *= zone
+              # গোঁফের পাশের ঝোলা দাগ ঠোঁটের প্রান্তের সাথে জুড়ে থাকে; তাই ঠোঁটের লাইনের উপরের পাশের অংশ আগেই কেটে ফেলা।
+              # কেন্দ্রে (উপরের ঠোঁট/A-র মুখ) বেশি উপরে পর্যন্ত অনুমতি, দুই পাশে সামান্য উপরে পর্যন্ত।
+              band = np.zeros((h, w), np.uint8)
+              band[max(0, int(ay - .13*rw)):, :] = 1
+              band[max(0, int(ay - .24*rw)):, max(0, int(ax - .30*rw)):int(ax + .30*rw)] = 1
+              dark *= band
               if mode == "legacy":
                   g = cv2.cvtColor(win, cv2.COLOR_BGR2GRAY); dark = ((g < 155).astype(np.uint8)) * zone
               dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 7)))
               cnts, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
               mask = np.zeros((h, w), np.uint8)
+              # ---- DOUBLE-MOUSTACHE FIX ----
+              # আগে কেন্দ্রের কাছাকাছি সব গাঢ় দাগ নেওয়া হতো; O/U chart-এ গোঁফের দুই পাশের ঝোলা চুলের দাগও
+              # "মুখ" ধরা পড়ত এবং body-র আসল গোঁফের ওপর বসে গোঁফ ডাবল দেখাত।
+              # এখন: (১) কেন্দ্রের সবচেয়ে কাছের/বড় contour = মুখের মূল অংশ, (২) শুধু তার গায়ে লাগানো/খুব কাছের টুকরো
+              # (ঠোঁটের প্রান্ত, দাঁতের ফাঁক) নেওয়া হয়, (৩) মুখের উপবৃত্তাকার সীমার বাইরের সবকিছু বাদ।
+              items = []
               for c in cnts:
                   x, y, ww, hh = cv2.boundingRect(c)
                   if cv2.contourArea(c) < 6 or ww < 4: continue
                   cx, cy = x + ww / 2.0, y + hh / 2.0
-                  if ((cx - ax) / (.50*rw)) ** 2 + ((cy - ay) / (.24*rw)) ** 2 > 1: continue      # কেন্দ্রের বাইরের দাগ (গোঁফ ইত্যাদি) বাদ
-                  cv2.drawContours(mask, [c], -1, 255, -1)
+                  d = ((cx - ax) / (.50*rw)) ** 2 + ((cy - ay) / (.24*rw)) ** 2
+                  items.append((d, cv2.contourArea(c), c, (x, y, ww, hh)))
+              if items:
+                  near = [t for t in items if t[0] <= 1.0] or items
+                  main = min(near, key=lambda t: t[0] - 0.002 * t[1])
+                  mx, my, mw_, mh_ = main[3]; mg = max(3, int(.06*rw))
+                  keep = [main]
+                  for t in items:
+                      if t is main: continue
+                      x, y, ww, hh = t[3]
+                      touches = not (x > mx + mw_ + mg or x + ww < mx - mg or y > my + mh_ + mg or y + hh < my - mg)
+                      cx, cy = x + ww / 2.0, y + hh / 2.0
+                      if touches and abs(cx - ax) < .40*rw and (cy - ay) > -.16*rw: keep.append(t)
+                  for t in keep: cv2.drawContours(mask, [t[2]], -1, 255, -1)
+                  lim = np.zeros((h, w), np.uint8)
+                  cv2.ellipse(lim, (int(ax), int(ay)), (int(.60*rw), int(.30*rw)), 0, 0, 360, 255, -1)      # মুখের সীমার বাইরে গোঁফ/দাড়ি যাবে না
+                  mask = cv2.bitwise_and(mask, lim)
               if mask.any():
                   # চওড়া মুখে (E/F/A/L) দাঁতের ফাঁক ভরাট করা, যাতে ভেতরে skin দেখা না যায়
                   xs = np.where(mask.max(axis=0) > 0)[0]
