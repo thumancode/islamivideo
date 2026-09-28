@@ -50,8 +50,6 @@ on:
         description: "আলাদা gesture timeline চাইলে file name"
         required: true
         default: "timestamps.txt"
-  push:
-    branches: [main]
 
 env:
   # workflow_dispatch থেকে edit করা যায়; push হলে এগুলো default হবে
