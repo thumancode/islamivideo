@@ -1,0 +1,379 @@
+name: Animated Bangla Podcast
+
+# Repo-র root-এ এই ফাইলগুলো রাখুন:
+#   body.jpg         -> ক্যারেক্টারের full body ছবি
+#   visemes.jpg      -> Viseme mouth chart
+#   expressions.jpg  -> Expression / eye-blink chart
+#   audio.mp3        -> আপনার পডকাস্টের ভয়েস (না থাকলে ডেমো বাংলা অডিও বানানো হবে)
+#   timestamps.txt   -> প্রতি লাইনে: শুরু | শেষ | সংলাপ | expression
+#   bgm.mp3          -> (ঐচ্ছিক) ব্যাকগ্রাউন্ড মিউজিক, ১০% ভলিউমে মিশবে
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  PODCAST_NAME: "আমার পডকাস্ট"          # নিয়ন সাইনে যা দেখাবে
+  EPISODE: "পর্ব ০১ | স্বাগতম"           # উপরের বাঁ কোণের ট্যাগ
+  RECOGNIZER: "phonetic"                 # বাংলা = phonetic, ইংরেজি অডিও হলে pocketSphinx
+
+jobs:
+  animate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg espeak-ng unzip fonts-noto-core libraqm0 libfribidi0 libharfbuzz0b
+          pip install pillow numpy opencv-python-headless gTTS
+
+      - name: Download Rhubarb Lip Sync
+        run: |
+          curl -sL -o rhubarb.zip https://github.com/DanielSWolf/rhubarb-lip-sync/releases/download/v1.13.0/Rhubarb-Lip-Sync-1.13.0-Linux.zip
+          unzip -q rhubarb.zip
+
+      - name: Render podcast video
+        run: |
+          cat > podcast.py <<'PYEOF'
+          import os, glob, json, math, random, re, shutil, subprocess, wave
+          import numpy as np, cv2
+          from PIL import Image, ImageDraw, ImageFont
+
+          # ============================== সেটিংস (yml-এর env থেকে আসে) ==============================
+          PODCAST_NAME = os.environ.get("PODCAST_NAME", "আমার পডকাস্ট")
+          EPISODE      = os.environ.get("EPISODE", "পর্ব ০১ | স্বাগতম")
+          AUDIO        = os.environ.get("AUDIO", "audio.mp3")
+          TIMESTAMPS   = os.environ.get("TIMESTAMPS", "timestamps.txt")
+          BGM          = os.environ.get("BGM", "bgm.mp3")            # ঐচ্ছিক ব্যাকগ্রাউন্ড মিউজিক
+          RECOGNIZER   = os.environ.get("RECOGNIZER", "phonetic")    # বাংলা/অন্য ভাষা: phonetic | ইংরেজি: pocketSphinx
+          OUT          = os.environ.get("OUT", "podcast.mp4")
+          W, H, FPS = 1280, 720, 24
+
+          # ============================== ১) অডিও (না থাকলে ডেমো বাংলা অডিও বানায়) ==============================
+          DEMO = [
+              ("আসসালামু আলাইকুম! আমার পডকাস্টে আপনাকে স্বাগতম।", "happy"),
+              ("আজকের বিষয় হলো, একজন অ্যান্ড্রয়েড ডেভেলপার কীভাবে অ্যানিমেশন দিয়ে আয় করতে পারে।", "neutral"),
+              ("এটা শুনে অনেকেই অবাক হন, কিন্তু এটা সম্ভব!", "surprised"),
+              ("তবে ধৈর্য আর নিয়মিত কাজ ছাড়া সফলতা আসে না।", "angry"),
+              ("চলুন, শুরু করা যাক!", "happy"),
+          ]
+          def make_demo():
+              SR = 22050; parts = [np.zeros(int(SR * .6), np.int16)]; t = .6; rows = []
+              for i, (txt, ex) in enumerate(DEMO):
+                  try:
+                      from gtts import gTTS
+                      gTTS(txt, lang="bn").save("d.mp3")
+                      subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", "d.mp3", "-ar", str(SR), "-ac", "1", f"d{i}.wav"], check=True)
+                  except Exception as e:
+                      print("gTTS নেই -> espeak-ng (bn):", e)
+                      subprocess.run(["espeak-ng", "-v", "bn", "-s", "135", "-w", f"r{i}.wav", txt], check=True)
+                      subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", f"r{i}.wav", "-ar", str(SR), "-ac", "1", f"d{i}.wav"], check=True)
+                  with wave.open(f"d{i}.wav") as w: a = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+                  d = len(a) / SR; rows.append(f"{t:.2f} | {t + d:.2f} | {txt} | {ex}")
+                  parts += [a, np.zeros(int(SR * .5), np.int16)]; t += d + .5
+              with wave.open("demo.wav", "wb") as w:
+                  w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR); w.writeframes(np.concatenate(parts).tobytes())
+              subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", "demo.wav", AUDIO], check=True)
+              open(TIMESTAMPS, "w", encoding="utf-8").write("# শুরু | শেষ | সংলাপ | expression (neutral/happy/angry/surprised)\n" + "\n".join(rows) + "\n")
+          if not os.path.exists(AUDIO):
+              print("audio.mp3 পাওয়া যায়নি -> ডেমো বানানো হচ্ছে"); make_demo()
+
+          subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", AUDIO, "-ar", "22050", "-ac", "1", "voice.wav"], check=True)
+          SR = 22050
+          with wave.open("voice.wav") as w: audio = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+          dur = len(audio) / SR; NF = int((dur + 0.6) * FPS) + 1
+
+          def tsec(s):
+              v = 0.0
+              for x in s.strip().split(":"): v = v * 60 + float(x)
+              return v
+          segs = []
+          if os.path.exists(TIMESTAMPS):
+              for ln in open(TIMESTAMPS, encoding="utf-8-sig"):
+                  ln = ln.strip()
+                  if not ln or ln.startswith("#"): continue
+                  p = [x.strip() for x in ln.split("|")]
+                  if len(p) < 3: continue
+                  segs.append(dict(s=tsec(p[0]), e=tsec(p[1]), text=p[2], ex=(p[3].lower() if len(p) > 3 and p[3] else "neutral")))
+          print("সংলাপের অংশ:", len(segs), "| অডিও দৈর্ঘ্য: %.1fs" % dur)
+
+          # ============================== ২) Lip-sync cues (Rhubarb) ==============================
+          cues = None
+          rb = shutil.which("rhubarb") or next(iter(glob.glob("Rhubarb*/rhubarb")), None)
+          if rb:
+              try:
+                  r = subprocess.run([rb, "-q", "-f", "json", "-r", RECOGNIZER, "voice.wav"], capture_output=True, text=True, check=True)
+                  cues = json.loads(r.stdout)["mouthCues"]
+              except Exception as e: print("rhubarb ব্যর্থ:", e)
+          x_ = audio.astype(np.float32) / 32768; hop = SR // FPS
+          lv = np.array([np.sqrt(np.mean(x_[i*hop:(i+1)*hop] ** 2) + 1e-9) if len(x_[i*hop:(i+1)*hop]) else 1e-4 for i in range(NF)]); lv = lv / (np.percentile(lv, 92) + 1e-6)
+          if cues is None:
+              cues = [{"start": i / FPS, "end": (i + 1) / FPS, "value": "X" if v < .12 else "B" if v < .4 else "C" if v < .75 else "D"} for i, v in enumerate(lv)]
+          MAP = {"A": "M", "B": "I", "C": "E", "D": "A", "E": "O", "F": "U", "G": "F", "H": "L", "X": "REST"}
+          VIS_AT, k = [], 0
+          for f in range(NF):
+              tt = f / FPS + .02
+              while k < len(cues) - 1 and cues[k]["end"] <= tt: k += 1
+              VIS_AT.append(MAP[cues[k]["value"]] if cues[k]["start"] <= tt < cues[k]["end"] else "REST")
+          env, e_ = np.zeros(NF), 0.0
+          for i, v in enumerate(np.clip(lv, 0, 1.3)): e_ += (v - e_) * (.5 if v > e_ else .2); env[i] = e_
+
+          # audio spectrum for the equalizer wall-screen
+          NB = 26; edges = np.geomspace(90, 7500, NB + 1); spec = np.zeros((NF, NB), np.float32); fr_ax = np.fft.rfftfreq(2048, 1 / SR); hann = np.hanning(2048)
+          xp = np.pad(x_, (1024, 1024 + 4096 + SR))
+          for i in range(NF):
+              c = int(i / FPS * SR); m = np.abs(np.fft.rfft(xp[c:c + 2048] * hann))
+              spec[i] = [m[(fr_ax >= edges[j]) & (fr_ax < edges[j + 1])].mean() if ((fr_ax >= edges[j]) & (fr_ax < edges[j + 1])).any() else 0 for j in range(NB)]
+          spec = np.log1p(spec * 40); spec /= (np.percentile(spec, 97) + 1e-6)
+          for i in range(1, NF): spec[i] = np.maximum(spec[i], spec[i - 1] * .8)      # smooth decay
+          spec = np.clip(spec, 0, 1)
+
+          # ============================== ৩) ক্যারেক্টার লেয়ার ==============================
+          body = cv2.imread("body.jpg"); vis = cv2.imread("visemes.jpg"); expr = cv2.imread("expressions.jpg")
+          _n, _lab = cv2.connectedComponents((body.min(axis=2) > 226).astype(np.uint8))
+          _edge = set(np.unique(np.concatenate([_lab[0], _lab[:, 0], _lab[:, -1]]))) - {0}
+          bgm_ = np.isin(_lab, list(_edge))
+          _n2, _lab2, _st, _cen = cv2.connectedComponentsWithStats((body.min(axis=2) > 226).astype(np.uint8))
+          for _i in range(1, _n2):     # মাথার উপরের ছোট বিচ্ছিন্ন সাদা দাগ (চুলের ফাঁক) ব্যাকগ্রাউন্ড ধরা হবে
+              if _i not in _edge and _st[_i, 4] < 500 and _cen[_i][1] < 330 and 430 < _cen[_i][0] < 850: bgm_ |= (_lab2 == _i)
+          body[bgm_] = 255
+          CX0, CY0, CX1, CY1 = 240, 20, 1040, 920; CW, CH = CX1 - CX0, CY1 - CY0
+          base = body[CY0:CY1, CX0:CX1].copy(); pm = (~bgm_[CY0:CY1, CX0:CX1]).astype(np.uint8)
+          # কিনারার সাদা আভা (halo) সরানো
+          band = (cv2.dilate(pm, np.ones((9, 9), np.uint8)) & ~cv2.erode(pm, np.ones((5, 5), np.uint8))) > 0
+          base = cv2.inpaint(base, band.astype(np.uint8) * 255, 3, cv2.INPAINT_TELEA)
+          alpha = cv2.GaussianBlur(pm.astype(np.float32), (0, 0), .8)
+          def M(v): m = np.array([[v[0], v[1], v[2]], [v[3], v[4], v[5]]], np.float64); m[:, 2] -= (CX0, CY0); return m
+          MV = {"A": (0.7087, 0.0037, 385.3856, -0.0037, 0.7087, 316.2662), "E": (0.7087, 0.0037, -37.0515, -0.0037, 0.7087, 296.895),
+                "I": (0.7087, 0.0037, -469.8417, -0.0037, 0.7087, 314.1024), "O": (0.7087, 0.0037, 385.8113, -0.0037, 0.7087, 67.2622),
+                "U": (0.7087, 0.0037, -42.0525, -0.0037, 0.7087, 69.6043), "M": (0.7087, 0.0037, -467.2179, -0.0037, 0.7087, 56.0688),
+                "F": (0.7087, 0.0037, 383.8982, -0.0037, 0.7087, -191.8591), "L": (0.7087, 0.0037, -39.9435, -0.0037, 0.7087, -193.943),
+                "REST": (0.7087, 0.0037, -467.7297, -0.0037, 0.7087, -191.7444)}
+          ME = {"neutral": (1.3335, 0.0096, 119.695, -0.0096, 1.3335, -80.6204), "closed": (1.3335, 0.0096, -1399.4663, -0.0096, 1.3335, -69.6228),
+                "happy": (1.3335, 0.0096, 114.0225, -0.0096, 1.3335, -805.0368), "angry": (1.3335, 0.0096, -648.8548, -0.0096, 1.3335, -801.2313),
+                "surprised": (1.3335, 0.0096, -1406.9181, -0.0096, 1.3335, -794.2282)}
+          def soft(fn, s): m = np.zeros((CH, CW), np.uint8); fn(m); return cv2.GaussianBlur(m, (0, 0), s).astype(np.float32)[..., None] / 255
+          def rect(x0, y0, x1, y1): return lambda m: cv2.rectangle(m, (x0 - CX0, y0 - CY0), (x1 - CX0, y1 - CY0), 255, -1)
+          mouth_mask = soft(lambda m: cv2.ellipse(m, (640 - CX0, 515 - CY0), (120, 78), 0, 0, 360, 255, -1), 10)
+          EMASK = {"neutral": soft(rect(496, 320, 786, 426), 7), "closed": soft(rect(496, 320, 786, 426), 7), "happy": soft(rect(496, 320, 786, 426), 7),
+                   "angry": soft(rect(490, 302, 792, 426), 7), "surprised": soft(rect(490, 296, 792, 426), 7)}
+          def bb(m): ys, xs = np.where(m[..., 0] > .003); return ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+          MB = bb(mouth_mask); EB = (292 - CY0, 428 - CY0, 490 - CX0, 792 - CX0)
+          def warp(src, mtx): return cv2.warpAffine(src, M(mtx), (CW, CH), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255)).astype(np.float32)
+          MOUTH = {k_: warp(vis, v)[MB[0]:MB[1], MB[2]:MB[3]] for k_, v in MV.items()}
+          EYES = {k_: warp(expr, v)[EB[0]:EB[1], EB[2]:EB[3]] for k_, v in ME.items()}
+          EM = {k_: v[EB[0]:EB[1], EB[2]:EB[3]] for k_, v in EMASK.items()}
+          MM = mouth_mask[MB[0]:MB[1], MB[2]:MB[3]]
+          basef = base.astype(np.float32); P4 = np.dstack([basef, alpha])
+          YY, XX = np.mgrid[0:CH, 0:CW].astype(np.float32); wgt = np.clip((CH - 20 - YY) / 480., 0, 1); wgt = wgt * wgt * (3 - 2 * wgt)
+          PX, PY = CW / 2, CH - 20
+          def bend(img, tilt, dy):
+              a = np.deg2rad(-tilt) * wgt; dx_, dy_ = XX - PX, (YY - dy * wgt) - PY
+              return cv2.remap(img, (PX + dx_ * np.cos(a) - dy_ * np.sin(a)).astype(np.float32), (PY + dx_ * np.sin(a) + dy_ * np.cos(a)).astype(np.float32),
+                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+          SC = 0.66; PW, PH = int(CW * SC), int(CH * SC); PX0, PY0 = 640 - PW // 2, 22
+
+          # ============================== ৪) ফন্ট ও বাংলা টেক্সট ==============================
+          def bfont(size, bold=False):
+              cand = ["/usr/share/fonts/truetype/noto/NotoSansBengali-%s.ttf" % ("Bold" if bold else "Regular")] + glob.glob("/usr/share/fonts/**/*Bengali*.ttf", recursive=True)
+              for p in cand:
+                  try: return ImageFont.truetype(p, size, layout_engine=ImageFont.Layout.RAQM)
+                  except Exception: pass
+              return ImageFont.load_default()
+          def efont(size):
+              try: return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
+              except Exception: return ImageFont.load_default()
+
+          # ============================== ৫) স্টুডিও ব্যাকগ্রাউন্ড (স্ট্যাটিক) ==============================
+          S = 2; rng = random.Random(5)
+          def grad(h, w, c0, c1):
+              t = np.linspace(0, 1, h, dtype=np.float32)[:, None, None]; return (np.array(c0, np.float32) * (1 - t) + np.array(c1, np.float32) * t) * np.ones((1, w, 1), np.float32)
+          bg = grad(H, W, (58, 38, 30), (34, 22, 20))                    # BGR: গাঢ় নীলচে দেয়াল
+          bgI = Image.fromarray(cv2.cvtColor(np.clip(bg, 0, 255).astype(np.uint8), cv2.COLOR_BGR2RGB)).resize((W * S, H * S)); d = ImageDraw.Draw(bgI, "RGBA")
+          q = lambda *a: [v * S for v in a]
+          # স্ল্যাট ওয়াল (মাঝে)
+          d.rectangle(q(300, 0, 980, 590), fill=(52, 36, 32, 255))
+          for x in range(300, 980, 26):
+              d.rectangle(q(x, 0, x + 20, 590), fill=(96, 66, 46, 255)); d.rectangle(q(x + 14, 0, x + 20, 590), fill=(70, 48, 36, 255))
+          # LED স্ট্রিপ
+          d.rectangle(q(300, 0, 980, 8), fill=(255, 200, 130, 255)); d.rectangle(q(300, 590, 980, 594), fill=(255, 160, 90, 200))
+          # বইয়ের তাক (বামে)
+          d.rounded_rectangle(q(30, 100, 285, 600), 8 * S, fill=(40, 28, 24, 255), outline=(20, 14, 12, 255), width=3)
+          pal = [(200, 70, 70), (70, 130, 200), (230, 190, 80), (90, 170, 120), (170, 100, 190), (230, 130, 70), (240, 240, 235)]
+          for r in range(4):
+              y1 = 100 + 30 + r * 118 + 88; x = 42
+              while x < 268:
+                  bw = rng.randint(14, 26); bh = rng.randint(58, 86)
+                  if x + bw > 272: break
+                  d.rectangle(q(x, y1 - bh, x + bw, y1), fill=rng.choice(pal) + (255,)); d.rectangle(q(x + 3, y1 - bh + 8, x + bw - 3, y1 - bh + 11), fill=(255, 255, 255, 120)); x += bw + 2
+              d.rectangle(q(34, y1, 281, y1 + 9), fill=(120, 80, 52, 255))
+          # ছোট গাছ (তাকের উপর)
+          d.rounded_rectangle(q(60, 70, 100, 100), 5 * S, fill=(220, 220, 215, 255))
+          for ang, ln in [(-50, 34), (-20, 44), (10, 46), (40, 36), (-80, 26)]:
+              ex_, ey_ = 80 + ln * math.sin(math.radians(ang)), 72 - ln * math.cos(math.radians(ang)); d.line(q(80, 72, ex_, ey_), fill=(60, 160, 90, 255), width=5 * S)
+              d.ellipse(q(ex_ - 9, ey_ - 7, ex_ + 9, ey_ + 7), fill=(80, 190, 110, 255))
+          # ফ্রেম (ডানে উপরে ছাড়া) - ছোট আর্ট
+          d.rounded_rectangle(q(1010, 30, 1100, 90), 6 * S, fill=(30, 24, 26, 255), outline=(200, 170, 120, 255), width=3 * S)
+          d.polygon(q(1020, 82, 1042, 48, 1060, 70, 1075, 52, 1092, 82), fill=(90, 150, 200, 255)); d.ellipse(q(1070, 38, 1084, 52), fill=(250, 220, 120, 255))
+          # EQ স্ক্রিন প্যানেল (ডানে)
+          d.rounded_rectangle(q(955, 250, 1245, 450), 14 * S, fill=(14, 12, 24, 255), outline=(90, 80, 130, 255), width=3 * S)
+          d.text(q(972, 258), "LIVE AUDIO", font=efont(13 * S), fill=(150, 140, 200, 255))
+          # ঘড়ি নয়, ডানদিকের ফ্লোর ল্যাম্প
+          d.rectangle(q(1200, 470, 1206, 600), fill=(30, 30, 34, 255)); d.polygon(q(1170, 470, 1236, 470, 1224, 430, 1182, 430), fill=(250, 200, 120, 255))
+          bgS = cv2.cvtColor(np.array(bgI.resize((W, H), Image.LANCZOS)), cv2.COLOR_RGB2BGR).astype(np.float32)
+          # হেড-হ্যালো (চরিত্রের পেছনে উষ্ণ আলো) ও ভিগনেট
+          yy, xx = np.mgrid[0:H, 0:W].astype(np.float32); hr = np.sqrt(((xx - 640) / 300) ** 2 + ((yy - 250) / 260) ** 2)
+          halo = np.clip(1 - hr, 0, 1) ** 1.6 * .55; bgS = bgS * (1 - halo[..., None]) + np.array([150, 200, 255], np.float32) * halo[..., None]
+          vg = 1 - .38 * np.clip(np.sqrt(((xx - 640) / 760) ** 2 + ((yy - 360) / 470) ** 2) - .35, 0, 1) ** 1.2; bgS *= vg[..., None]
+
+          # ডেস্ক + মাইক + কফি মগ (ক্যারেক্টারের সামনে)
+          fgI = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0)); g = ImageDraw.Draw(fgI, "RGBA")
+          g.rectangle(q(0, 585, 1280, 650), fill=(150, 100, 64, 255))
+          for y in range(585, 650, 4): g.line(q(0, y, 1280, y), fill=(138, 93, 60, 255), width=S)
+          g.rectangle(q(0, 585, 1280, 590), fill=(210, 160, 110, 255)); g.rectangle(q(0, 650, 1280, 720), fill=(88, 58, 40, 255)); g.rectangle(q(0, 650, 1280, 655), fill=(60, 38, 28, 255))
+          # মাইক: বেস, বাহু, ক্যাপসুল
+          g.ellipse(q(455, 592, 535, 616), fill=(30, 30, 36, 255)); g.line(q(490, 604, 526, 560), fill=(46, 46, 54, 255), width=9 * S)
+          mic = Image.new("RGBA", (120 * S, 200 * S), (0, 0, 0, 0)); md = ImageDraw.Draw(mic)
+          md.rounded_rectangle((25 * S, 20 * S, 95 * S, 160 * S), 34 * S, fill=(38, 40, 48, 255), outline=(100, 104, 120, 255), width=3 * S)
+          for yy_ in range(36, 150, 8): md.line((30 * S, yy_ * S, 90 * S, yy_ * S), fill=(88, 92, 108, 255), width=2 * S)
+          md.rectangle((28 * S, 96 * S, 92 * S, 104 * S), fill=(200, 60, 60, 255))
+          mic = mic.rotate(-24, resample=Image.BICUBIC, expand=True); fgI.alpha_composite(mic, ((540 - mic.width // 2 // S) * S, (494 - mic.height // 2 // S) * S))
+          # মগ
+          g.rounded_rectangle(q(840, 545, 905, 600), 8 * S, fill=(240, 240, 236, 255)); g.arc(q(892, 555, 926, 590), -90, 90, fill=(240, 240, 236, 255), width=6 * S)
+          g.ellipse(q(844, 545, 902, 556), fill=(90, 56, 34, 255)); g.rectangle(q(850, 572, 896, 578), fill=(230, 90, 90, 255))
+          # নোটবুক ও কলম
+          g.polygon(q(960, 610, 1080, 606, 1092, 640, 966, 646), fill=(240, 236, 220, 255), outline=(180, 170, 150, 255)); g.line(q(985, 625, 1060, 622), fill=(140, 140, 160, 255), width=2 * S); g.line(q(985, 633, 1050, 631), fill=(140, 140, 160, 255), width=2 * S)
+          fgA = np.array(fgI.resize((W, H), Image.LANCZOS)).astype(np.float32); FG = cv2.cvtColor(fgA[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32); FGa = fgA[..., 3:4] / 255
+
+          # নিয়ন সাইন ও ON AIR
+          def glow_layer(size, draw_fn, blur):
+              im = Image.new("RGBA", size, (0, 0, 0, 0)); draw_fn(ImageDraw.Draw(im)); a = np.array(im).astype(np.float32)
+              rgb = cv2.cvtColor(a[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32); al = a[..., 3:4] / 255
+              gl = cv2.GaussianBlur(rgb * al, (0, 0), blur); return rgb, al, gl
+          NX0, NY0, NW, NH = 930, 70, 330, 150
+          def neon_draw(dr):
+              f = bfont(46, True); tw = dr.textlength(PODCAST_NAME, font=f)
+              if tw > NW - 40: f = bfont(int(46 * (NW - 40) / tw), True); tw = dr.textlength(PODCAST_NAME, font=f)
+              dr.rounded_rectangle((8, 12, NW - 8, NH - 12), 22, outline=(255, 90, 200, 255), width=4)
+              dr.text(((NW - tw) / 2, 34), PODCAST_NAME, font=f, fill=(255, 210, 245, 255))
+              dr.line((60, NH - 34, NW - 60, NH - 34), fill=(80, 220, 255, 255), width=4)
+          N_RGB, N_A, N_GL = glow_layer((NW, NH), neon_draw, 9)
+          OX0, OY0, OW, OH = 1010, 470, 170, 56
+          def air_draw(dr):
+              dr.rounded_rectangle((4, 4, OW - 4, OH - 4), 14, fill=(200, 30, 40, 255), outline=(255, 120, 120, 255), width=3); dr.text((OW / 2, OH / 2), "ON AIR", font=efont(26), fill=(255, 235, 235, 255), anchor="mm")
+          A_RGB, A_A, A_GL = glow_layer((OW, OH), air_draw, 8)
+          # ফ্লিকার
+          fl = np.ones(NF, np.float32); rr = random.Random(3); i = 0
+          while i < NF:
+              i += rr.randint(40, 110)
+              for j in range(rr.randint(2, 4)):
+                  if i + j < NF: fl[i + j] = .45 if j % 2 == 0 else .9
+          # ধুলিকণা
+          dust = [(rng.uniform(300, 980), rng.uniform(40, 560), rng.uniform(.2, .7), rng.uniform(0, 6.28)) for _ in range(40)]
+
+          # ============================== ৬) সাবটাইটেল ও শিরোনাম ==============================
+          def wrap(dr, text, f, maxw):
+              out, cur = [], ""
+              for wd in text.split():
+                  t_ = (cur + " " + wd).strip()
+                  if dr.textlength(t_, font=f) > maxw and cur: out.append(cur); cur = wd
+                  else: cur = t_
+              return out + [cur]
+          CAPF = bfont(29); tmpd = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+          def cap_img(text):
+              lines = wrap(tmpd, text, CAPF, 980); lh = 46; w_ = int(max(tmpd.textlength(l, font=CAPF) for l in lines)) + 56; h_ = lh * len(lines) + 18
+              im = Image.new("RGBA", (w_, h_), (0, 0, 0, 0)); dr = ImageDraw.Draw(im); dr.rounded_rectangle((0, 0, w_ - 1, h_ - 1), 18, fill=(12, 12, 26, 205))
+              for i_, l in enumerate(lines): dr.text((w_ / 2, 9 + lh * i_ + lh / 2 - 2), l, font=CAPF, fill=(255, 255, 255, 255), anchor="mm")
+              a = np.array(im).astype(np.float32); return cv2.cvtColor(a[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32), a[..., 3:4] / 255
+          CAPS = [cap_img(s["text"]) for s in segs]
+          tf = bfont(24, True); tw_ = int(tmpd.textlength(EPISODE, font=tf)) + 44
+          ti = Image.new("RGBA", (tw_, 46), (0, 0, 0, 0)); td = ImageDraw.Draw(ti); td.rounded_rectangle((0, 0, tw_ - 1, 45), 22, fill=(220, 50, 90, 235)); td.ellipse((14, 17, 26, 29), fill=(255, 255, 255, 255)); td.text((36, 23), EPISODE, font=tf, fill=(255, 255, 255, 255), anchor="lm")
+          ta = np.array(ti).astype(np.float32); T_RGB = cv2.cvtColor(ta[..., :3].astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32); T_A = ta[..., 3:4] / 255
+          def put(canvas, rgb, a, x0, y0, k=1.0):
+              h_, w_ = a.shape[:2]; x0 = int(x0); y0 = int(y0); r = canvas[y0:y0 + h_, x0:x0 + w_]; aa = a * k; r[:] = r * (1 - aa) + rgb * aa
+
+          # ============================== ৭) টাইমলাইন ==============================
+          def seg_at(tt):
+              for i_, s in enumerate(segs):
+                  if s["s"] <= tt <= s["e"] + .25: return i_
+              return -1
+          EXN = ["neutral", "happy", "angry", "surprised"]; wexp = {k_: 0.0 for k_ in EXN}; wexp["neutral"] = 1.0
+          rnd = random.Random(11); blinks = sorted({int(rnd.uniform(1.0, dur + .3) * FPS) for _ in range(max(3, int(dur / 3.2)))}); PROF = [.35, .85, 1, .85, .35]
+          def blink_lvl(f):
+              for b in blinks:
+                  if 0 <= f - b < len(PROF): return PROF[f - b]
+              return 0.
+
+          # ============================== ৮) রেন্ডার ==============================
+          cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(FPS), "-i", "-", "-i", AUDIO]
+          if os.path.exists(BGM): cmd += ["-stream_loop", "-1", "-i", BGM, "-filter_complex", "[2:a]volume=0.10[b];[1:a][b]amix=inputs=2:duration=first:normalize=0,apad[a]", "-map", "0:v", "-map", "[a]"]
+          else: cmd += ["-map", "0:v", "-map", "1:a", "-af", "apad"]
+          ff = subprocess.Popen(cmd + ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-t", "%.3f" % (NF / FPS), OUT], stdin=subprocess.PIPE)
+          prev_seg = -1
+          for f in range(NF):
+              tt = f / FPS; si = seg_at(tt)
+              if si != prev_seg and si >= 0: seg_start = tt
+              prev_seg = si
+              tgt = segs[si]["ex"] if si >= 0 and segs[si]["ex"] in EXN else "neutral"
+              for k_ in EXN: wexp[k_] += ((1.0 if k_ == tgt else 0.0) - wexp[k_]) * .28
+              fr = basef.copy(); r0, r1, c0, c1 = EB
+              roi = fr[r0:r1, c0:c1]
+              for k_ in ["neutral", "happy", "angry", "surprised"]:
+                  w_ = wexp[k_]
+                  if w_ > .01: m_ = EM[k_] * w_; roi[:] = roi * (1 - m_) + EYES[k_] * m_
+              b_ = blink_lvl(f)
+              if b_ > 0: m_ = EM["closed"] * b_; roi[:] = roi * (1 - m_) + EYES["closed"] * m_
+              m0, m1, n0, n1 = MB; fr[m0:m1, n0:n1] = fr[m0:m1, n0:n1] * (1 - MM) + MOUTH[VIS_AT[f]] * MM
+              # শরীরের ভাষা: শ্বাস, বলার সময় মাথা দোলা, প্রতি অংশের শুরুতে নড
+              nod = 0.
+              if si >= 0 and tt - seg_start < .45: nod = math.sin(math.pi * (tt - seg_start) / .45)
+              dy = 3.5 * math.sin(tt * 1.9) + 9 * env[f] * math.sin(tt * 6.3 + 1) * .4 + 12 * nod
+              tilt = 1.0 * math.sin(tt * 1.15) + 1.2 * env[f] * math.sin(tt * 3.1)
+              p = cv2.resize(bend(np.dstack([fr, alpha]), tilt, dy), (PW, PH), interpolation=cv2.INTER_AREA)
+              cv = bgS.copy()
+              # ধুলিকণা
+              for (dx0, dy0, sz, ph) in dust:
+                  px = dx0 + 12 * math.sin(tt * .4 + ph); py = (dy0 - tt * 6 * sz) % 560 + 20; cv2.circle(cv, (int(px), int(py)), 1, (200, 230, 255), -1, cv2.LINE_AA) if sz > .45 else cv2.circle(cv, (int(px), int(py)), 1, (120, 150, 170), -1)
+              # ক্যারেক্টার
+              put(cv, p[..., :3], p[..., 3:4], PX0, PY0)
+              # নিয়ন ও ON AIR (ঝিকমিক)
+              k_n = fl[f]; put(cv, N_RGB, N_A, NX0, NY0, 1); reg = cv[NY0:NY0 + NH, NX0:NX0 + NW]; reg += N_GL * (.9 * k_n)
+              pulse = .65 + .35 * math.sin(tt * 2.4) ** 2 + .25 * env[f]; put(cv, A_RGB, A_A, OX0, OY0, 1); reg2 = cv[OY0:OY0 + OH, OX0:OX0 + OW]; reg2 += A_GL * pulse
+              # ইকুয়ালাইজার
+              ex0, ey0, ew, eh = 972, 282, 256, 156; roi_e = cv[ey0:ey0 + eh, ex0:ex0 + ew]; layer = np.zeros_like(roi_e); bw = ew / NB
+              for j in range(NB):
+                  hh = int(6 + spec[f, j] * (eh - 12)); x_a = int(j * bw + 1); col = (int(255 - 200 * j / NB), int(120 + 110 * spec[f, j]), int(90 + 160 * j / NB))
+                  cv2.rectangle(layer, (x_a, eh - hh), (int(x_a + bw - 3), eh), col, -1)
+              roi_e += layer * .95 + cv2.GaussianBlur(layer, (0, 0), 5) * .7
+              # ডেস্ক/মাইক/মগ
+              put(cv, FG, FGa, 0, 0)
+              # মগের ধোঁয়া
+              ov = np.zeros((90, 60, 3), np.float32)
+              for kk in range(3):
+                  pts = np.array([[int(30 + (kk - 1) * 12 + 7 * math.sin(tt * 2 + yv / 11 + kk * 2)), 88 - yv] for yv in range(0, 86, 4)], np.int32)
+                  cv2.polylines(ov, [pts.reshape(-1, 1, 2)], False, (235, 235, 240), 3, cv2.LINE_AA)
+              ov = cv2.GaussianBlur(ov, (0, 0), 2.2); sy, sx = 455, 848; reg3 = cv[sy:sy + 90, sx:sx + 60]; reg3 += ov * .55
+              # ধীর ক্যামেরা জুম
+              z = 1.0 + .035 * (tt / max(dur, 1)); Mz = np.array([[z, 0, (1 - z) * 640], [0, z, (1 - z) * 330]], np.float32)
+              out = cv2.warpAffine(np.clip(cv, 0, 255).astype(np.uint8), Mz, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+              put(out, T_RGB, T_A, 34, 26)
+              if si >= 0:
+                  rgb, a = CAPS[si]; k_c = min(1., (tt - segs[si]["s"] + .15) / .15, (segs[si]["e"] + .25 - tt) / .15 + .0) if True else 1.
+                  put(out, rgb, a, (W - a.shape[1]) // 2, 712 - a.shape[0], max(0., min(1., k_c)))
+              ff.stdin.write(np.clip(out, 0, 255).astype(np.uint8).tobytes())
+          ff.stdin.close(); ff.wait(); print("তৈরি হয়েছে:", OUT)
+          PYEOF
+          python podcast.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: podcast-video
+          path: |
+            podcast.mp4
+            timestamps.txt
