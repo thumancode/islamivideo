@@ -1,0 +1,74 @@
+name: Render Google Play Badge Animation
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  render-video:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            libcairo2-dev \
+            libpango1.0-dev \
+            texlive-latex-base \
+            texlive-fonts-recommended \
+            texlive-latex-extra \
+            texlive-science
+
+      - name: Install Python Packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install manim
+
+      - name: Create Manim Python Script
+        run: |
+          cat << 'EOF' > render_script.py
+          from manim import *
+
+          class GooglePlayBadge(Scene):
+              def construct(self):
+                  badge_bg = RoundedRectangle(corner_radius=0.2, width=4.5, height=1.5, color=WHITE, fill_opacity=1)
+                  badge_bg.set_color(BLACK)
+                  
+                  tri_blue = Polygon([-1.6, 0.4, 0], [-1.6, -0.4, 0], [-1.0, 0, 0], color="#00D2FF", fill_opacity=1)
+                  tri_red = Polygon([-1.6, 0.4, 0], [-1.0, 0, 0], [-1.2, 0.5, 0], color="#FF334B", fill_opacity=1)
+                  tri_yellow = Polygon([-1.6, -0.4, 0], [-1.0, 0, 0], [-1.2, -0.5, 0], color="#FFD000", fill_opacity=1)
+                  tri_green = Polygon([-1.6, 0.4, 0], [-1.6, -0.4, 0], [-1.2, 0, 0], color="#00E676", fill_opacity=1)
+                  
+                  logo = VGroup(tri_blue, tri_red, tri_yellow, tri_green)
+                  
+                  text_top = Text("GET IT ON", font="Arial", font_size=18, color=WHITE).move_to([0.5, 0.3, 0])
+                  text_bottom = Text("Google Play", font="Arial", font_size=32, weight=BOLD, color=WHITE).move_to([0.6, -0.2, 0])
+                  
+                  badge_group = VGroup(badge_bg, logo, text_top, text_bottom)
+                  
+                  self.play(FadeIn(badge_bg, scale=0.8), run_time=1)
+                  self.play(DrawBorderThenFill(logo), run_time=1.5)
+                  self.play(Write(text_top), Write(text_bottom), run_time=1.5)
+                  self.wait(1)
+          EOF
+
+      - name: Run Manim to Export Video
+        run: |
+          manim -ql render_script.py GooglePlayBadge
+
+      - name: Upload Video Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: google-play-badge-video
+          path: media/videos/
